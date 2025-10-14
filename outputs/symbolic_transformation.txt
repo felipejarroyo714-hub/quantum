@@ -1,0 +1,3 @@
+Using Ψ(x) = e^{-(D/C) x / 2} φ(x) removes the first derivative.
+Resulting ODE: φ'' - [ (e^{2 α x}/C) (V0 x^2 - E) + (α^2)/4 ] φ = 0,
+since D/C = α for C=ħ^2/(2 m α^2), D=ħ^2/(2 m α).
