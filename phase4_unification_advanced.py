@@ -37,7 +37,7 @@ class AdvancedBackreactionConfig:
     # time stepping
     eta_max: int = 200
     dt_init: float = 0.02
-    dt_min: float = 1e-5
+    dt_min: float = 5e-6
     dt_max: float = 0.05
     ls_shrink: float = 0.5
     dt_growth: float = 1.1
@@ -50,8 +50,8 @@ class AdvancedBackreactionConfig:
     kappa_local_p: float = 2.0  # localization exponent for |rho-1|^p
 
     # quantum coupling weights
-    lambda_R: float = 5.0      # curvature penalty weight in energy functional
-    lambda_Q: float = 0.0      # quantum energy weight (set 0 for monotone descent)
+    lambda_R: float = 10.0     # stronger curvature penalty
+    lambda_Q: float = 0.1      # turn on quantum backreaction weight
     scale_Q: float = 1.0       # normalization for e_ren
 
     # spectra resolution
@@ -90,11 +90,29 @@ def scalar_adiabatic_freq0(z: np.ndarray, r: np.ndarray, R: np.ndarray, q: Quant
     base = q.mu**2 + q.xi * R + (q.m_theta**2) / np.clip(r**2, 1e-18, None)
     return np.sqrt(np.clip(base, 1e-12, None))
 
+def scalar_adiabatic_freq2(z: np.ndarray, r: np.ndarray, R: np.ndarray, q: QuantumFieldParams) -> np.ndarray:
+    # Simple second-order correction proxy using curvature and radial gradient scales
+    dz = z[1] - z[0]
+    rp = np.gradient(r, dz)
+    rpp = np.gradient(rp, dz)
+    base0 = q.mu**2 + q.xi * R + (q.m_theta**2) / np.clip(r**2, 1e-18, None)
+    corr = 0.25 * ((rpp / np.clip(r, 1e-18, None))**2 + (rp / np.clip(r, 1e-18, None))**2)
+    return np.sqrt(np.clip(base0 + corr, 1e-12, None))
+
 
 def fermion_adiabatic_energy0(z: np.ndarray, r: np.ndarray, q: QuantumFieldParams) -> np.ndarray:
     # Local positive energy for 2D Dirac (rest + angular): eps_ad(z) = sqrt(m_f^2 + (m_theta/r)^2)
     base = q.m_fermion**2 + (q.m_theta_f**2) / np.clip(r**2, 1e-18, None)
     return np.sqrt(np.clip(base, 1e-12, None))
+
+def fermion_adiabatic_energy2(z: np.ndarray, r: np.ndarray, q: QuantumFieldParams) -> np.ndarray:
+    # Include simple geometric correction proxy similar to scalar
+    dz = z[1] - z[0]
+    rp = np.gradient(r, dz)
+    rpp = np.gradient(rp, dz)
+    base0 = q.m_fermion**2 + (q.m_theta_f**2) / np.clip(r**2, 1e-18, None)
+    corr = 0.25 * ((rpp / np.clip(r, 1e-18, None))**2 + (rp / np.clip(r, 1e-18, None))**2)
+    return np.sqrt(np.clip(base0 + corr, 1e-12, None))
 
 
 def compute_renormalized_energy_density(z: np.ndarray, r: np.ndarray, q: QuantumFieldParams, cfg: AdvancedBackreactionConfig) -> np.ndarray:
@@ -107,7 +125,7 @@ def compute_renormalized_energy_density(z: np.ndarray, r: np.ndarray, q: Quantum
 
     # Scalar contribution (bosonic + sign +)
     w, modes = compute_scalar_modes_local(z, r, q, cfg.k_scalar)
-    omega_ad = scalar_adiabatic_freq0(z, r, R, q)
+    omega_ad = scalar_adiabatic_freq2(z, r, R, q)
     # local energy density: 1/2 * sum_j (omega_j - omega_ad(z)) |u_j(z)|^2
     e_phi = np.zeros_like(r, dtype=float)
     for j in range(len(w)):
@@ -123,7 +141,7 @@ def compute_renormalized_energy_density(z: np.ndarray, r: np.ndarray, q: Quantum
     from phase4_unification import dirac_modes
     evals, spinors = dirac_modes(z, r, dcfg)
     n = len(z)
-    eps_ad = fermion_adiabatic_energy0(z, r, q)
+    eps_ad = fermion_adiabatic_energy2(z, r, q)
     e_psi = np.zeros_like(r, dtype=float)
     for j in range(min(len(evals), spinors.shape[1])):
         psi = spinors[:, j]

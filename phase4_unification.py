@@ -31,7 +31,7 @@ class DiracGeoConfig:
     lam: float = math.sqrt(6.0) / 2.0
     z_min: float = -10.0
     z_max: float = 10.0
-    num_z: int = 1200
+    num_z: int = 2000
     r0: float = 1.0
     epsilon: float = 0.0  # fluctuation amplitude for geometric modulation
 
@@ -158,8 +158,14 @@ def check_dirac_lambda_covariance(geo: DiracGeoConfig, field: DiracFieldConfig) 
             upB_s, dnB_s = B_shift[j][:n], B_shift[j][n:]
             O[i, j] = abs(np.trapezoid((np.conj(upA) * upB_s + np.conj(dnA) * dnB_s).real, zA))
 
-    row_max = O.max(axis=1)
-    overlaps = row_max
+    # Best one-to-one matching via Hungarian algorithm to maximize total overlap
+    try:
+        from scipy.optimize import linear_sum_assignment
+        row_ind, col_ind = linear_sum_assignment(-O)  # maximize
+        overlaps = O[row_ind, col_ind]
+    except Exception:
+        # Fallback: row-wise maxima
+        overlaps = O.max(axis=1)
     # trimmed mean to reduce boundary effects
     if overlaps.size >= 10:
         t = int(0.2 * overlaps.size)
