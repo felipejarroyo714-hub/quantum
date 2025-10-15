@@ -285,3 +285,37 @@ if __name__ == '__main__':
     print(f"Computed {len(evals)} eigenpairs. Min/Max E: {evals.min():.6f}/{evals.max():.6f}")
     print("Saved results to outputs/results.npz and plots to outputs/eigenvalues_vs_x_and_pr.png")
     verify_and_plot(evals, x_vals, pr_values, params)
+
+    # Additional Phase 1 metrics and report
+    n_pred = np.round(x_vals)
+    coeffs = np.polyfit(n_pred, evals, deg=2)
+    E_fit = np.polyval(coeffs, n_pred)
+    # R^2 for quadratic fit
+    ss_res = float(np.sum((evals - E_fit) ** 2))
+    ss_tot = float(np.sum((evals - np.mean(evals)) ** 2))
+    r2 = 1.0 - (ss_res / (ss_tot + 1e-18))
+    # Localization: mean |x - n|
+    loc_dev = float(np.mean(np.abs(x_vals - n_pred)))
+    # Degeneracy: count near-degenerate quartets per integer n by grouping x near n
+    # A simple method: for each integer n in observed range, count states with |x-n| < 0.15
+    n_min = int(np.floor(x_vals.min()))
+    n_max = int(np.ceil(x_vals.max()))
+    quartet_counts = {}
+    for n in range(n_min, n_max + 1):
+        mask = np.abs(x_vals - n) < 0.15
+        quartet_counts[n] = int(np.sum(mask))
+
+    report_lines = []
+    report_lines.append("Phase 1 metrics")
+    report_lines.append(f"lambda_scale = {params.lambda_scale:.6f}, V0 = {params.V0:.3f}, t = {params.t:.3f}")
+    report_lines.append(f"Quadratic fit E ~ a n^2 + b n + c: a={coeffs[0]:.6f}, b={coeffs[1]:.6f}, c={coeffs[2]:.6f}")
+    report_lines.append(f"R^2 = {r2:.8f}")
+    report_lines.append(f"Localization mean |x - n| = {loc_dev:.6e}")
+    # Summarize quartet counts
+    q_summary = ", ".join([f"n={n}:{cnt}" for n, cnt in quartet_counts.items() if cnt > 0])
+    report_lines.append(f"States per shell (|x-n|<0.15): {q_summary}")
+
+    with open('outputs/phase1_report.txt', 'w') as f:
+        f.write("\n".join(report_lines) + "\n")
+
+    print("Saved Phase 1 metrics to outputs/phase1_report.txt")
