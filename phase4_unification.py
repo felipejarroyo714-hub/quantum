@@ -29,7 +29,7 @@ class BackreactionParams:
     lam: float = math.sqrt(6.0) / 2.0
     z_min: float = -10.0
     z_max: float = 10.0
-    num_z: int = 2400  # refined grid
+    num_z: int = 2400  # refined grid (can increase further if needed)
     r0: float = 1.0
     epsilon0: float = 0.05  # initial λ-periodic modulation to relax away
 
@@ -41,20 +41,31 @@ class BackreactionParams:
 
     # Semiclassical backreaction weights
     lambda_Q: float = 0.25  # > 0, strength of quantum backreaction
-    lambda_R: float = 0.35  # smoothing on ρ via Laplacian(ρ)
-    kappa: float = 1.0      # smoothing on u = ln r via Laplacian(u)
+    lambda_R: float = 0.35  # base smoothing on ρ via Laplacian(ρ)
+    kappa: float = 1.0      # base smoothing on u = ln r via Laplacian(u)
+    # Localized feedback boosts (scaled by smoothed |ρ-1| in [0,1])
+    kappa_boost: float = 3.0
+    lambdaR_boost: float = 2.0
 
     # Time stepping for energy descent on ||ρ−1||
     dt_init: float = 2e-3
-    dt_min: float = 1e-5  # tighter minimum for stability
+    dt_min: float = 5e-6  # tighter minimum for stiff regimes
     dt_max: float = 2e-2
     decay_factor: float = 0.5
     grow_factor: float = 1.1
-    max_iters: int = 120
+    max_iters: int = 200
     tol_rho: float = 5e-3
 
     # Adiabatic subtraction
     adiabatic_order: int = 2  # 0 or 2 (least-squares curvature fit)
+    robust_quantile: float = 0.95  # robust scaling for e_ren normalization
+
+    # Step control
+    du_cap: float = 5e-3       # cap on |Δu| per step (L∞)
+    backtracking_max_steps: int = 60
+
+    # Local smoothing window (in grid points) for feedback weights
+    local_smooth_window: int = 21
 
 
 # ---------- Helpers ----------
@@ -76,6 +87,20 @@ def gradient(arr: np.ndarray, dz: float) -> np.ndarray:
     out[0] = (arr[1] - arr[0]) / dz
     out[-1] = (arr[-1] - arr[-2]) / dz
     return out
+
+
+def smooth1d(arr: np.ndarray, window: int) -> np.ndarray:
+    # Simple edge-padded moving-average smoothing; window must be odd
+    w = max(1, int(window))
+    if w % 2 == 0:
+        w += 1
+    if w == 1:
+        return arr.copy()
+    pad = w // 2
+    kernel = np.ones(w, dtype=float) / float(w)
+    arr_pad = np.pad(arr, (pad, pad), mode='edge')
+    sm = np.convolve(arr_pad, kernel, mode='same')
+    return sm[pad:-pad]
 
 
 def compute_curvature_from_r(r: np.ndarray, dz: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -150,15 +175,20 @@ def adiabatic_subtraction(e_cur: np.ndarray,
 
 def renormalized_stress(z: np.ndarray, r: np.ndarray, R: np.ndarray,
                         field: FieldParams, k: int, adiabatic_order: int,
-                        ref_profile: Tuple[np.ndarray, np.ndarray, np.ndarray]) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+                        ref_profile: Tuple[np.ndarray, np.ndarray, np.ndarray] = None,
+                        ref_loc: Dict[str, np.ndarray] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
     # Current background
     w_cur, modes_cur, pot_cur = build_operator_and_modes(z, r, R, field, k)
     loc_cur = local_stress_components(z, r, modes_cur, w_cur, pot_cur)
 
-    # Reference background (epsilon=0 profile) on same z-grid
-    z_ref, r_ref, R_ref = ref_profile
-    w_ref, modes_ref, pot_ref = build_operator_and_modes(z_ref, r_ref, R_ref, field, k)
-    loc_ref = local_stress_components(z_ref, r_ref, modes_ref, w_ref, pot_ref)
+    # Reference background (epsilon=0) local stress, computed once if provided
+    if ref_loc is not None:
+        loc_ref = ref_loc
+    else:
+        assert ref_profile is not None, "Either ref_loc or ref_profile must be provided"
+        z_ref, r_ref, R_ref = ref_profile
+        w_ref, modes_ref, pot_ref = build_operator_and_modes(z_ref, r_ref, R_ref, field, k)
+        loc_ref = local_stress_components(z_ref, r_ref, modes_ref, w_ref, pot_ref)
 
     # Basic subtraction (adiabatic 0): current - reference
     e0 = loc_cur["E"] - loc_ref["E"]
@@ -262,9 +292,12 @@ def run_unification() -> None:
     # Reference background (epsilon=0) on same z grid for subtraction
     georef = GeometryParams(lam=p.lam, z_min=p.z_min, z_max=p.z_max, num_z=p.num_z, r0=p.r0, epsilon=0.0)
     z_ref, r_ref, _, R_ref = integrate_profile(georef)
-
-    # Field parameters
+    # Precompute reference local stress once
     field = FieldParams(mu=p.mu, xi=p.xi, m_theta=p.m_theta, k_eig=p.k_eig)
+    w_ref, modes_ref, pot_ref = build_operator_and_modes(z_ref, r_ref, R_ref, field, p.k_eig)
+    ref_loc = local_stress_components(z_ref, r_ref, modes_ref, w_ref, pot_ref)
+
+    # Field parameters (already instantiated above)
 
     # Log-profile to evolve
     u = np.log(r0.copy())
@@ -286,28 +319,46 @@ def run_unification() -> None:
         rho = rp / (alpha * np.clip(r, 1e-18, None))
 
         # Compute renormalized stress on current background
-        stress, coeffs = renormalized_stress(z, r, R, field, p.k_eig, p.adiabatic_order,
-                                             ref_profile=(z_ref, r_ref, R_ref))
+        stress, coeffs = renormalized_stress(
+            z, r, R, field, p.k_eig, p.adiabatic_order,
+            ref_loc=ref_loc
+        )
         e_ren = stress["E"]
 
         # Backreaction driving term in u (log r)
-        # Normalize e_ren for stability
-        e_norm = e_ren / (np.max(np.abs(e_ren)) + 1e-12)
+        # Robustly normalize e_ren and lightly smooth
+        scale_e = max(np.quantile(np.abs(e_ren), p.robust_quantile), 1e-12)
+        e_norm = e_ren / scale_e
+        e_norm = smooth1d(e_norm, p.local_smooth_window)
 
         # Components for update
         uzz = second_derivative(u, dz)
         rhozz = second_derivative(rho, dz)
         delta_rho = 1.0 - rho
 
-        du_dt = (delta_rho
-                 - p.lambda_Q * e_norm
-                 + p.kappa * uzz
-                 + p.lambda_R * rhozz)
+        # Localized feedback weights based on smoothed |ρ−1|
+        err = smooth1d(np.abs(1.0 - rho), p.local_smooth_window)
+        if np.max(err) > 0:
+            err = err / np.max(err)
+        kappa_loc = p.kappa * (1.0 + p.kappa_boost * err)
+        lambdaR_loc = p.lambda_R * (1.0 + p.lambdaR_boost * err)
+
+        du_dt = (
+            delta_rho
+            - p.lambda_Q * e_norm
+            + kappa_loc * uzz
+            + lambdaR_loc * rhozz
+        )
 
         # Backtracking line search for descent of ||ρ−1||
         accepted = False
-        for _ in range(20):
-            u_try = u + dt * du_dt
+        for _ in range(p.backtracking_max_steps):
+            # Cap per-step Δu to avoid overshoot
+            du = dt * du_dt
+            max_abs_du = float(np.max(np.abs(du)))
+            if max_abs_du > p.du_cap:
+                du *= (p.du_cap / (max_abs_du + 1e-18))
+            u_try = u + du
             r_try = np.exp(u_try)
             rp_try = gradient(r_try, dz)
             rho_try = rp_try / (alpha * np.clip(r_try, 1e-18, None))
