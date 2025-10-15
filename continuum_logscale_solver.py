@@ -201,14 +201,38 @@ def run_continuum_phase2() -> None:
     for n in [0, 1, 2]:
         # Predict width Δx ~ (C/(2V0))^{1/4} e^{-α n/2}
         dx_pred = (C/(2.0*V0))**0.25 * math.exp(-0.5*alpha*n)
-        # Optionally refine domain near n (not strictly necessary as global grid used)
-        E_n, phi_n = find_eigenvalue_near(n, params, W, x_grid)
-        psi_n = reconstruct_psi_from_phi(x_grid, phi_n, alpha)
-        dens_n, mean_x, std_x = normalize_density(x_grid, psi_n)
-        results.append(dict(n=n, E=E_n, x=x_grid, psi=psi_n, dens=dens_n, mean_x=mean_x, std_x=std_x, dx_pred=dx_pred))
+        # Narrow focus around x≈n to stabilize higher-n width measurement
+        local_min = max(params.x_min, n - 2.0)
+        local_max = min(params.x_max, n + 2.0)
+        local_grid = np.linspace(local_min, local_max, max(800, int((params.grid_points/ (params.x_max-params.x_min)) * (local_max-local_min))))
+        E_n, phi_n = find_eigenvalue_near(n, params, W, local_grid)
+        # Reconstruct on local grid for accurate width; also build a global extension for plotting convenience
+        psi_local = reconstruct_psi_from_phi(local_grid, phi_n, alpha)
+        dens_local, mean_x, std_x = normalize_density(local_grid, psi_local)
+        # Gaussian width via local log-quadratic fit around the peak
+        idx_pk = int(np.argmax(dens_local))
+        x_pk = float(local_grid[idx_pk])
+        y_max = float(dens_local[idx_pk])
+        # Use window where dens is not too small to avoid numerical issues
+        mask = dens_local >= max(1e-12, 0.2 * y_max)
+        xw = local_grid[mask]
+        yw = dens_local[mask]
+        if xw.size >= 8:
+            x_shift2 = (xw - x_pk)**2
+            # Fit ln y ≈ c0 + c2 * (x - x_pk)^2
+            A = np.column_stack([np.ones_like(x_shift2), x_shift2])
+            coeff, *_ = np.linalg.lstsq(A, np.log(np.maximum(yw, 1e-300))),
+            c0, c2 = coeff[0]
+            if c2 < 0:
+                std_fit = float(math.sqrt(max(1e-18, -1.0/(2.0*c2))))
+            else:
+                std_fit = float(std_x)
+        else:
+            std_fit = float(std_x)
+        results.append(dict(n=n, E=E_n, x=local_grid, psi=psi_local, dens=dens_local, mean_x=mean_x, std_x=std_x, std_fit=std_fit, dx_pred=dx_pred))
 
     # Plot |Ψ_n(x)|^2 for n=0,1,2
-    fig, ax = plt.subplots(1, 2, figsize=(12, 5))
+    fig, ax = plt.subplots(1, 3, figsize=(14, 4))
     for r in results:
         ax[0].plot(r['x'], r['dens'], label=f"n={r['n']} (E≈{r['E']:.3f})")
     ax[0].set_xlabel('x = ln r / ln λ')
@@ -220,13 +244,22 @@ def run_continuum_phase2() -> None:
     widths = [r['std_x'] for r in results]
     widths_pred = [r['dx_pred'] for r in results]
 
-    ax[1].plot(ns, widths, 'o-', label='Measured Δx')
-    ax[1].plot(ns, widths_pred, 's--', label='Predicted Δx ∝ e^{-α n/2}')
+    ax[1].plot(ns, widths, 'o-', label='Δx (std)')
+    ax[1].plot(ns, widths_pred, 's--', label='Δx_pred ∝ e^{-α n/2}')
     ax[1].set_xlabel('n')
-    ax[1].set_ylabel('Δx (std)')
-    ax[1].set_title('Width vs n (exponential decay)')
+    ax[1].set_ylabel('Δx')
+    ax[1].set_title('Widths (std) vs prediction')
     ax[1].grid(True)
     ax[1].legend()
+
+    widths_fit = [r.get('std_fit', r['std_x']) for r in results]
+    ax[2].plot(ns, widths_fit, 'o-', label='Δx (Gaussian fit)')
+    ax[2].plot(ns, widths_pred, 's--', label='Δx_pred ∝ e^{-α n/2}')
+    ax[2].set_xlabel('n')
+    ax[2].set_ylabel('Δx')
+    ax[2].set_title('Widths (Gaussian fit) vs prediction')
+    ax[2].grid(True)
+    ax[2].legend()
 
     plt.tight_layout()
     plt.savefig('outputs/continuum_wavefunctions_and_widths.png', dpi=150)
@@ -237,11 +270,28 @@ def run_continuum_phase2() -> None:
              lam=params.lam, alpha=alpha, V0=V0,
              E=np.array([r['E'] for r in results]),
              ns=np.array(ns),
-             widths=np.array(widths), widths_pred=np.array(widths_pred))
+             widths=np.array(widths), widths_fit=np.array([r.get('std_fit', r['std_x']) for r in results]),
+             widths_pred=np.array(widths_pred))
+
+    # Save concise metrics report
+    ratios_std = []
+    ratios_fit = []
+    if len(widths) >= 2:
+        ratios_std.append(widths[1]/widths[0] if widths[0] > 0 else float('nan'))
+        ratios_fit.append(widths_fit[1]/widths_fit[0] if widths_fit[0] > 0 else float('nan'))
+    if len(widths) >= 3:
+        ratios_std.append(widths[2]/widths[1] if widths[1] > 0 else float('nan'))
+        ratios_fit.append(widths_fit[2]/widths_fit[1] if widths_fit[1] > 0 else float('nan'))
+    with open('outputs/phase2_report.txt', 'w') as f:
+        f.write(f"Eigenvalues (n=0,1,2): {', '.join(f'{e:.6f}' for e in [r['E'] for r in results])}\n")
+        f.write(f"Predicted ladder V0*n^2 (V0={V0:.3f}): {', '.join(f'{V0*(i**2):.6f}' for i in ns)}\n")
+        f.write(f"Width ratios std (1/0,2/1): {ratios_std}\n")
+        f.write(f"Width ratios fit (1/0,2/1): {ratios_fit}\n")
+        f.write(f"Predicted ratio e^(-alpha/2)={math.exp(-alpha/2.0):.6f}\n")
 
     # Console summary
     for r in results:
-        print(f"n={r['n']}: E={r['E']:.6f}, mean_x={r['mean_x']:.4f}, Δx={r['std_x']:.6e}, Δx_pred~{r['dx_pred']:.6e}")
+        print(f"n={r['n']}: E={r['E']:.6f}, mean_x={r['mean_x']:.4f}, Δx={r['std_x']:.6e}, Δx_fit={r.get('std_fit', r['std_x']):.6e}, Δx_pred~{r['dx_pred']:.6e}")
 
 
 if __name__ == '__main__':
