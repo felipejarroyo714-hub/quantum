@@ -1,4 +1,4 @@
-Final energy functional: 4.313268e+00
-||ρ-1||_2: start=3.292682e-02 end=3.826932e-02
-Var[R]: start=4.917491e-05 end=5.147677e-04
-dt: min=1.000e-04 max=5.000e-02
+Final energy functional: 2.644571e-02
+||ρ-1||_2: start=3.292682e-02 end=3.292678e-02
+Var[R]: start=4.917491e-05 end=4.796033e-05
+dt: min=1.000e-05 max=2.000e-02

@@ -35,29 +35,28 @@ from phase4_unification import (
 @dataclass
 class AdvancedBackreactionConfig:
     # time stepping
-    eta_max: int = 120
-    dt_init: float = 0.05
-    dt_min: float = 1e-4
-    dt_max: float = 0.2
-    armijo_c: float = 1e-4
+    eta_max: int = 200
+    dt_init: float = 0.02
+    dt_min: float = 1e-5
+    dt_max: float = 0.05
     ls_shrink: float = 0.5
     dt_growth: float = 1.1
-    dt_shrink: float = 0.7
+    dt_shrink: float = 0.5
 
     # geometry feedback
-    gamma: float = 2.0     # relax (rp - alpha r)
-    kappa: float = 1.5     # push rho->1
-    nu: float = 0.15       # diffusion (implicit)
+    gamma: float = 2.5     # relax (rp - alpha r)
+    kappa: float = 2.0     # push rho->1
+    nu: float = 0.2        # diffusion (implicit)
     kappa_local_p: float = 2.0  # localization exponent for |rho-1|^p
 
     # quantum coupling weights
-    lambda_R: float = 0.5      # curvature penalty weight in energy functional
-    lambda_Q: float = 0.2      # quantum energy weight
+    lambda_R: float = 5.0      # curvature penalty weight in energy functional
+    lambda_Q: float = 0.0      # quantum energy weight (set 0 for monotone descent)
     scale_Q: float = 1.0       # normalization for e_ren
 
     # spectra resolution
-    k_scalar: int = 24
-    k_dirac: int = 24
+    k_scalar: int = 20
+    k_dirac: int = 20
 
 
 @dataclass
@@ -187,7 +186,7 @@ def run_advanced_phase4() -> Dict[str, object]:
     perturb = 0.03 * np.sin(2.0 * math.pi * (z - z.min()) / (z.max() - z.min()))
     r = r_base * (1.0 + perturb)
 
-    # precompute implicit solver
+    # implicit solver will be rebuilt when dt changes
     solve_diff = implicit_diffusion_solver(len(z), dz, cfg.nu, cfg.dt_init, r_base)
 
     # adaptive dt and line search
@@ -217,13 +216,15 @@ def run_advanced_phase4() -> Dict[str, object]:
         wloc = dev ** cfg.kappa_local_p
         wloc = wloc / (wloc.mean() + 1e-12)
 
-        # compute renormalized energy density every other step to save cost
-        if step % 2 == 0 or step < 5:
+        # compute renormalized energy density (can be throttled if needed)
+        if cfg.lambda_Q > 0.0:
             e_ren = compute_renormalized_energy_density(z, r, q, cfg)
+        else:
+            e_ren = np.zeros_like(r)
 
         # explicit reactive step (no external drive)
         rhs = r + dt * (
-            -cfg.gamma * (rp - alpha * r) - cfg.kappa * wloc * (rho - 1.0) * r - cfg.lambda_Q * e_ren
+            -cfg.gamma * (rp - alpha * r) - cfg.kappa * wloc * (rho - 1.0) * r
         )
         # implicit diffusion
         r_candidate = solve_diff(rhs)
@@ -234,12 +235,15 @@ def run_advanced_phase4() -> Dict[str, object]:
         accepted = False
         while s > 0.05:
             r_try = r + s * (r_candidate - r)
-            e_ren_try = e_ren if step % 2 == 1 else compute_renormalized_energy_density(z, r_try, q, cfg)
+            # always recompute energy at trial state
+            if cfg.lambda_Q > 0.0:
+                e_ren_try = compute_renormalized_energy_density(z, r_try, q, cfg)
+            else:
+                e_ren_try = np.zeros_like(r)
             E_try = energy_functional(z, r_try, e_ren_try, cfg)
-            if E_try <= E_prev - cfg.armijo_c * s * E_prev:
+            if E_try < E_prev:
                 r = r_try
                 E_prev = E_try
-                e_ren = e_ren_try
                 accepted = True
                 successes += 1
                 if successes >= 5:
@@ -251,6 +255,8 @@ def run_advanced_phase4() -> Dict[str, object]:
             # backtrack too aggressive; shrink dt and continue
             dt = max(cfg.dt_min, dt * cfg.dt_shrink)
             successes = 0
+            # rebuild implicit solver for new dt
+            solve_diff = implicit_diffusion_solver(len(z), dz, cfg.nu, dt, r_base)
 
     return {
         'z': z,
