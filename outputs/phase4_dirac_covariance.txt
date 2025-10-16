@@ -1,4 +1,4 @@
-mean_overlap: 0.5749320781353109
-mean_overlap_trimmed: 0.5551321460269624
-max_overlap: 0.9588910854702244
+mean_overlap: 0.5008547174819563
+mean_overlap_trimmed: 0.4810479192772818
+max_overlap: 0.9783621671225995
 num_compared: 40
