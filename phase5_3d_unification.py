@@ -64,10 +64,10 @@ class Geometry3DParams:
     z_min: float = -10.0  # evolutional depth axis
     z_max: float = 10.0
     
-    # Grid resolution
-    num_x: int = 64
-    num_y: int = 64
-    num_z: int = 128
+    # Grid resolution (reduced for memory efficiency)
+    num_x: int = 32
+    num_y: int = 32
+    num_z: int = 64
     
     # 3D curvature parameters
     kappa_z: float = 0.1  # curvature constant κ_z = ∂²Φ/∂z²
@@ -88,7 +88,7 @@ class Field3DParams:
     m_theta: int = 0  # angular momentum
     
     # 3D spectrum
-    k_eig: int = 32  # number of 3D modes
+    k_eig: int = 16  # number of 3D modes
     
     # 3D backreaction
     lambda_Q: float = 0.2  # quantum backreaction strength
@@ -100,8 +100,8 @@ class Field3DParams:
 class Backreaction3DParams:
     """3D backreaction parameters extending 2D framework."""
     # 3D geometry
-    geo: Geometry3DParams = Geometry3DParams()
-    field: Field3DParams = Field3DParams()
+    geo: Geometry3DParams = None
+    field: Field3DParams = None
     
     # 3D evolution parameters
     dt_init: float = 1e-3
@@ -303,6 +303,10 @@ def run_3d_unification() -> None:
     
     # Initialize 3D parameters
     p = Backreaction3DParams()
+    if p.geo is None:
+        p.geo = Geometry3DParams()
+    if p.field is None:
+        p.field = Field3DParams()
     geo = p.geo
     field = p.field
     
