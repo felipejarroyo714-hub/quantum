@@ -3,16 +3,15 @@
 Phase 4 Unification Enhanced Campaign - CORRECTED VERSION
 ========================================================
 
-This corrected script implements the proper λ-harmonic ladder simulation
-according to the Proof Sketch principles, using golden ratio scaling
-and validating the continuum limit.
+This corrected script addresses the issues in the original simulation while
+maintaining the correct tetrahedral kernel λ = √6/2 as specified in the sim stack document.
 
 Key Corrections:
-1. Use golden ratio scaling: λ = e^(φ-1) ≈ 1.854 (not √6/2)
+1. Add realistic quantum effects (tunneling, finite-size corrections)
 2. Implement proper continuum limit validation
-3. Add realistic quantum effects (tunneling, finite-size corrections)
-4. Validate the master ODE r'(z) = h(r(z))
-5. Demonstrate true λ-harmonic ladder behavior
+3. Fix energy scaling to demonstrate λ-harmonic ladder behavior
+4. Add proper connectivity between shells
+5. Validate the master ODE r'(z) = h(r(z))
 """
 
 import numpy as np
@@ -22,21 +21,19 @@ from math import sqrt, log, exp
 import csv
 import os
 from scipy.integrate import solve_ivp
-import sympy as sp
 
-def golden_ratio_scaling():
-    """Calculate the correct golden ratio scaling parameters."""
-    phi = (1 + sqrt(5)) / 2  # Golden ratio
-    k = phi - 1  # φ - 1
-    lambda_val = exp(k)  # λ = e^(φ-1)
-    return phi, k, lambda_val
+def tetrahedral_scaling():
+    """Calculate the correct tetrahedral scaling parameters."""
+    lambda_val = sqrt(6) / 2  # Tetrahedral kernel as specified in sim stack
+    return lambda_val
 
 def solve_master_ode(lambda_val, z_range, r0=1.0):
-    """Solve the master ODE r'(z) = h(r(z)) = (φ-1)r(z) for validation."""
-    phi, k, _ = golden_ratio_scaling()
+    """Solve the master ODE r'(z) = h(r(z)) for validation."""
+    # For the tetrahedral kernel, the master ODE is r'(z) = k*r(z) where k = ln(λ)
+    k = log(lambda_val)
     
     def ode_func(z, r):
-        return k * r  # r'(z) = (φ-1)r(z)
+        return k * r  # r'(z) = k*r(z) where k = ln(λ)
     
     sol = solve_ivp(ode_func, [z_range[0], z_range[-1]], [r0], 
                    t_eval=z_range, rtol=1e-10, atol=1e-12)
@@ -48,9 +45,8 @@ def create_realistic_tight_binding_model(lambda_val, num_shells=15, V0=5.0, t_ho
     
     # Parameters
     R0 = 1.0
-    phi, k, _ = golden_ratio_scaling()
     
-    print(f"Using golden ratio scaling: φ = {phi:.6f}, λ = {lambda_val:.6f}")
+    print(f"Using tetrahedral kernel: λ = √6/2 = {lambda_val:.6f}")
     
     # Build tetrahedron vertices with proper normalization
     tetra_base = np.array([
@@ -61,7 +57,7 @@ def create_realistic_tight_binding_model(lambda_val, num_shells=15, V0=5.0, t_ho
     ], dtype=float)
     tetra_base = tetra_base / np.linalg.norm(tetra_base[0])
     
-    # Create nodes with golden ratio scaling
+    # Create nodes with tetrahedral scaling
     rng = np.random.default_rng(42)  # Different seed for variety
     nodes = []
     radii = []
@@ -70,7 +66,7 @@ def create_realistic_tight_binding_model(lambda_val, num_shells=15, V0=5.0, t_ho
     for n in range(num_shells):
         R = R0 * (lambda_val ** n)
         
-        # Add small random perturbations to break perfect degeneracy
+        # Add realistic random perturbations to break perfect degeneracy
         for i in range(4):  # 4 vertices per tetrahedron
             # Small random rotation and position perturbation
             theta = (rng.random() - 0.5) * 0.1  # Larger rotation for realism
@@ -99,7 +95,7 @@ def create_realistic_tight_binding_model(lambda_val, num_shells=15, V0=5.0, t_ho
     shell_indices = np.array(shell_indices)
     N = nodes.shape[0]
     
-    print(f"Created {N} nodes across {num_shells} shells with golden ratio scaling")
+    print(f"Created {N} nodes across {num_shells} shells with tetrahedral scaling")
     
     # Build more realistic adjacency matrix
     dists = np.linalg.norm(nodes[:, None, :] - nodes[None, :, :], axis=2)
@@ -186,13 +182,14 @@ def validate_continuum_limit(lambda_val, z_range):
     """Validate the continuum limit by solving the master ODE."""
     
     print(f"\nContinuum Limit Validation:")
-    print(f"Solving master ODE r'(z) = (φ-1)r(z) for λ = {lambda_val:.6f}")
+    print(f"Solving master ODE r'(z) = k*r(z) for λ = {lambda_val:.6f}")
+    print(f"where k = ln(λ) = {log(lambda_val):.6f}")
     
     # Solve the ODE
     r_solution = solve_master_ode(lambda_val, z_range)
     
     # Check scaling behavior
-    phi, k, _ = golden_ratio_scaling()
+    k = log(lambda_val)
     expected_r = np.exp(k * z_range)
     
     print(f"ODE solution matches exponential: {np.allclose(r_solution, expected_r, rtol=1e-6)}")
@@ -208,13 +205,11 @@ def main():
     """Main corrected simulation function."""
     
     print("Phase 4 Unification Enhanced Campaign - CORRECTED VERSION")
-    print("=" * 60)
+    print("=" * 70)
     
-    # Get correct golden ratio scaling
-    phi, k, lambda_val = golden_ratio_scaling()
-    print(f"Golden ratio φ = {phi:.6f}")
-    print(f"Scaling constant k = φ - 1 = {k:.6f}")
-    print(f"λ = e^k = {lambda_val:.6f}")
+    # Get correct tetrahedral scaling
+    lambda_val = tetrahedral_scaling()
+    print(f"Tetrahedral kernel λ = √6/2 = {lambda_val:.6f}")
     
     # Create realistic tight-binding model
     H, nodes, radii, shell_indices, scaled_log = create_realistic_tight_binding_model(
@@ -234,7 +229,7 @@ def main():
     )
     
     # Validate continuum limit
-    z_range = np.linspace(0, 5, 50)
+    z_range = np.linspace(0, 4, 50)
     r_solution = validate_continuum_limit(lambda_val, z_range)
     
     # Create comprehensive plots
@@ -245,7 +240,7 @@ def main():
     ax1.plot(xvals[:M], eigvals[:M], 'bo-', markersize=4)
     ax1.set_xlabel(r'$\ln(\langle r\rangle)/\ln(\lambda)$')
     ax1.set_ylabel('Eigenvalue (energy)')
-    ax1.set_title('Corrected: λ-Harmonic Ladder')
+    ax1.set_title('Corrected: λ-Harmonic Ladder (Tetrahedral Kernel)')
     ax1.grid(True, alpha=0.3)
     
     # Plot 2: Shell energy scaling
@@ -259,7 +254,7 @@ def main():
     
     # Plot 3: Continuum limit validation
     ax3.plot(z_range, r_solution, 'b-', label='ODE Solution', linewidth=2)
-    expected_r = np.exp(k * z_range)
+    expected_r = np.exp(log(lambda_val) * z_range)
     ax3.plot(z_range, expected_r, 'r--', label='Expected r(z)', linewidth=2)
     ax3.set_xlabel('z')
     ax3.set_ylabel('r(z)')
@@ -288,7 +283,7 @@ def main():
     
     # Save plots
     os.makedirs("outputs", exist_ok=True)
-    plot_path = "outputs/phase4_corrected_lambda_harmonic.png"
+    plot_path = "outputs/phase4_corrected_tetrahedral_lambda_harmonic.png"
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     print(f"\nSaved corrected analysis to {plot_path}")
     plt.show()
@@ -296,8 +291,6 @@ def main():
     # Save detailed results
     results = {
         'lambda_val': lambda_val,
-        'phi': phi,
-        'k': k,
         'eigenvalues': eigvals,
         'radial_expectations': r_expect,
         'participation_ratios': PR,
@@ -307,7 +300,7 @@ def main():
     }
     
     # Save CSV
-    csv_path = "outputs/phase4_corrected_results.csv"
+    csv_path = "outputs/phase4_corrected_tetrahedral_results.csv"
     with open(csv_path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['k', 'eigenvalue', 'r_expect', 'PR', 'x_scaled_log', 'shell_index'])
