@@ -89,7 +89,7 @@ def run_unification_enhanced() -> None:
         rho = rp / (alpha * np.clip(r, 1e-18, None))
 
         # Renormalized stress on current background using precomputed ref_loc
-        stress, coeffs = renormalized_stress(z, r, R, field, p.k_eig, p.adiabatic_order, ref_loc=ref_loc)
+        stress, coeffs = renormalized_stress(z, r, R, field, p.k_eig, p.adiabatic_order, ref_profile=(z_ref, r_ref, R_ref))
         e_ren = stress['E']
 
         # Robust normalization + smoothing
