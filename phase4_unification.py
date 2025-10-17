@@ -350,8 +350,15 @@ def run_unification() -> None:
             + lambdaR_loc * rhozz
         )
 
-        # Backtracking line search for descent of ||ρ−1||
+        # Backtracking line search for descent of ||ρ−1|| with windowed acceptance
         accepted = False
+        # Initialize windowing parameters
+        accept_window = int(getattr(p, 'accept_window', 5))
+        accept_rel_budget = float(getattr(p, 'accept_window_rel_budget', 5e-6))
+        accept_abs_budget = float(getattr(p, 'accept_window_abs_budget', 1e-9))
+        if 'window_count' not in globals():
+            globals()['window_count'] = 0
+            globals()['last_anchor_norm'] = norm_prev
         for _ in range(p.backtracking_max_steps):
             # Cap per-step Δu to avoid overshoot
             du = dt * du_dt
@@ -363,11 +370,24 @@ def run_unification() -> None:
             rp_try = gradient(r_try, dz)
             rho_try = rp_try / (alpha * np.clip(r_try, 1e-18, None))
             norm_try = float(np.sqrt(np.trapezoid((rho_try - 1.0) ** 2, z)))
-            if norm_try <= norm_prev + 1e-12:
+            # Windowed acceptance logic
+            budget = globals()['last_anchor_norm'] * accept_rel_budget + accept_abs_budget
+            is_window_end = ((globals()['window_count'] + 1) % accept_window) == 0
+            if is_window_end:
+                enforce_margin = max(globals()['last_anchor_norm'] * p.ls_rel_tol, p.ls_abs_tol)
+                ok = norm_try <= (globals()['last_anchor_norm'] - enforce_margin + getattr(p, 'ls_pos_slack', 0.0))
+            else:
+                ok = norm_try <= (globals()['last_anchor_norm'] + budget)
+            if ok:
                 # accept step
                 u = u_try
                 norm_prev = norm_try
                 accepted = True
+                if is_window_end:
+                    globals()['last_anchor_norm'] = norm_try
+                    globals()['window_count'] = 0
+                else:
+                    globals()['window_count'] += 1
                 break
             else:
                 dt = max(p.dt_min, dt * p.decay_factor)

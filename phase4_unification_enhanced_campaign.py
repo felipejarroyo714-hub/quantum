@@ -90,6 +90,13 @@ def simulate_one(
     norm_prev = float(np.sqrt(np.trapezoid((rho - 1.0) ** 2, z)))
 
     max_steps = p.max_iters if long_time else min(60, p.max_iters)
+    # Windowed acceptance controls and λ_Q decay
+    accept_window = int(getattr(p, 'accept_window', 5))
+    accept_rel_budget = float(getattr(p, 'accept_window_rel_budget', 5e-6))
+    accept_abs_budget = float(getattr(p, 'accept_window_abs_budget', 1e-9))
+    lambda_Q_decay = float(getattr(p, 'lambda_Q_decay', 1.0))
+    window_count = 0
+    last_anchor_norm = None
 
     # Iterative relaxation
     for it in range(max_steps):
@@ -144,13 +151,15 @@ def simulate_one(
         kappa_loc = p.kappa * (1.0 + p.kappa_boost * err)
         lambdaR_loc = p.lambda_R * (1.0 + p.lambdaR_boost * err)
 
-        du_dt = delta_rho - p.lambda_Q * e_norm + kappa_loc * uzz + lambdaR_loc * rhozz
+        # Effective λ_Q decays over iterations to reduce stiffness progressively
+        q_base = (lambda_Q_decay ** it) if lambda_Q_decay != 1.0 else 1.0
+        du_dt = delta_rho - (p.lambda_Q * q_base) * e_norm + kappa_loc * uzz + lambdaR_loc * rhozz
 
         # Backtracking with cap
         accepted = False
         q = 1.0
         for _ in range(p.backtracking_max_steps):
-            du = dt * (delta_rho - (p.lambda_Q * q) * e_norm + kappa_loc * uzz + lambdaR_loc * rhozz)
+            du = dt * (delta_rho - (p.lambda_Q * q_base * q) * e_norm + kappa_loc * uzz + lambdaR_loc * rhozz)
             max_abs_du = float(np.max(np.abs(du)))
             if max_abs_du > p.du_cap:
                 du *= (p.du_cap / (max_abs_du + 1e-18))
@@ -159,16 +168,25 @@ def simulate_one(
             rp_try = gradient(r_try, dz)
             rho_try = rp_try / (alpha * np.clip(r_try, 1e-18, None))
             norm_try = float(np.sqrt(np.trapezoid((rho_try - 1.0) ** 2, z)))
-            # acceptance threshold with tiny positive slack to avoid numerical pinning
-            thresh = (
-                norm_prev * (1.0 - getattr(p, 'ls_rel_tol', 1e-6))
-                + getattr(p, 'ls_abs_tol', 1e-9)
-                + getattr(p, 'ls_pos_slack', 0.0)
-            )
-            if norm_try <= thresh:
+            # Windowed acceptance: allow tiny increases within budget inside window; enforce net descent at window end
+            if last_anchor_norm is None:
+                last_anchor_norm = norm_prev
+            budget = last_anchor_norm * accept_rel_budget + accept_abs_budget
+            is_window_end = ((window_count + 1) % accept_window) == 0
+            if is_window_end:
+                enforce_margin = max(last_anchor_norm * getattr(p, 'ls_rel_tol', 1e-6), getattr(p, 'ls_abs_tol', 1e-9))
+                ok = norm_try <= (last_anchor_norm - enforce_margin + getattr(p, 'ls_pos_slack', 0.0))
+            else:
+                ok = norm_try <= (last_anchor_norm + budget)
+            if ok:
                 u = u_try
                 norm_prev = norm_try
                 accepted = True
+                if is_window_end:
+                    last_anchor_norm = norm_try
+                    window_count = 0
+                else:
+                    window_count += 1
                 break
             else:
                 if dt <= p.dt_min + 1e-15:
