@@ -18,12 +18,12 @@ def run_longrun() -> Dict:
     # Many-step monotone schedule per directive
     p = EnhancedParams(
         max_iters=6000,
-        du_cap=0.30,
+        du_cap=0.35,
         ls_rel_tol=2e-5,
         ls_abs_tol=1e-8,
         robust_quantile=0.90,
-        lambda_Q=0.20,
-        dt_init=1e-3,
+        lambda_Q=0.18,
+        dt_init=2e-3,
         dt_min=1e-10,
         k_eig=18,
         local_smooth_window=15,
@@ -32,7 +32,7 @@ def run_longrun() -> Dict:
     )
     # Apply tiny positive acceptance slack to avoid numerical pinning
     try:
-        setattr(p, 'ls_pos_slack', 1e-6)
+        setattr(p, 'ls_pos_slack', 5e-6)
     except Exception:
         pass
     res = simulate_one(p, long_time=True)
