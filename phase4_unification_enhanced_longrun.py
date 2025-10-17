@@ -17,7 +17,7 @@ def run_longrun() -> Dict:
     os.makedirs('outputs', exist_ok=True)
     # Many-step monotone schedule per directive
     p = EnhancedParams(
-        max_iters=16000,
+        max_iters=24000,
         du_cap=0.30,
         ls_rel_tol=2e-5,
         ls_abs_tol=1e-9,
@@ -25,10 +25,10 @@ def run_longrun() -> Dict:
         lambda_Q=0.15,
         dt_init=2e-3,
         dt_min=1e-12,
-        k_eig=16,
+        k_eig=14,
         local_smooth_window=15,
         epsilon0=0.50,
-        num_z=600,
+        num_z=500,
     )
     # Apply tiny positive acceptance slack to avoid numerical pinning
     try:
@@ -49,13 +49,14 @@ def run_longrun() -> Dict:
     )
     pA.kappa *= 0.5
     pA.lambda_R *= 0.5
-    setattr(pA, 'lambda_Q_decay', 0.93)
+    pA.lambda_Q = 0.12
+    setattr(pA, 'lambda_Q_decay', 0.90)
     setattr(pA, 'accept_window', 3)
     setattr(pA, 'window_end_abs_margin', 2e-5)
     setattr(pA, 'accept_window_rel_budget', 1e-7)
     setattr(pA, 'smooth_window', 5)
     pA.du_cap = 0.38
-    pA.max_iters = 8000
+    pA.max_iters = 12000
     resA = simulate_one(pA, long_time=True)
 
     # Stage B: restore curvature to nominal and continue from Stage A final state
@@ -72,7 +73,7 @@ def run_longrun() -> Dict:
     setattr(pB, 'accept_window_rel_budget', 1e-7)
     setattr(pB, 'smooth_window', 5)
     pB.du_cap = 0.30
-    pB.max_iters = 8000
+    pB.max_iters = 12000
     resB = simulate_one(pB, long_time=True, init_u=init_u)
 
     # Combine histories for fitting/plotting
