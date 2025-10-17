@@ -159,7 +159,12 @@ def simulate_one(
             rp_try = gradient(r_try, dz)
             rho_try = rp_try / (alpha * np.clip(r_try, 1e-18, None))
             norm_try = float(np.sqrt(np.trapezoid((rho_try - 1.0) ** 2, z)))
-            thresh = norm_prev * (1.0 - getattr(p, 'ls_rel_tol', 1e-6)) + getattr(p, 'ls_abs_tol', 1e-9)
+            # acceptance threshold with tiny positive slack to avoid numerical pinning
+            thresh = (
+                norm_prev * (1.0 - getattr(p, 'ls_rel_tol', 1e-6))
+                + getattr(p, 'ls_abs_tol', 1e-9)
+                + getattr(p, 'ls_pos_slack', 0.0)
+            )
             if norm_try <= thresh:
                 u = u_try
                 norm_prev = norm_try

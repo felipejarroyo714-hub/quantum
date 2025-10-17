@@ -18,17 +18,17 @@ def run_longrun() -> Dict:
     # Many-step monotone schedule per directive
     p = EnhancedParams(
         max_iters=5000,
-        du_cap=0.24,
+        du_cap=0.28,
         ls_rel_tol=2e-5,
         ls_abs_tol=1e-8,
         robust_quantile=0.90,
         lambda_Q=0.20,
-        dt_init=2e-4,
-        dt_min=1e-9,
-        k_eig=24,
-        local_smooth_window=17,
-        epsilon0=0.10,
-        num_z=900,
+        dt_init=1e-3,
+        dt_min=1e-10,
+        k_eig=20,
+        local_smooth_window=15,
+        epsilon0=0.30,
+        num_z=800,
     )
     res = simulate_one(p, long_time=True)
 
