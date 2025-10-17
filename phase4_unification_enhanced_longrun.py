@@ -17,19 +17,24 @@ def run_longrun() -> Dict:
     os.makedirs('outputs', exist_ok=True)
     # Many-step monotone schedule per directive
     p = EnhancedParams(
-        max_iters=5000,
-        du_cap=0.28,
+        max_iters=6000,
+        du_cap=0.30,
         ls_rel_tol=2e-5,
         ls_abs_tol=1e-8,
         robust_quantile=0.90,
         lambda_Q=0.20,
         dt_init=1e-3,
         dt_min=1e-10,
-        k_eig=20,
+        k_eig=18,
         local_smooth_window=15,
         epsilon0=0.30,
-        num_z=800,
+        num_z=700,
     )
+    # Apply tiny positive acceptance slack to avoid numerical pinning
+    try:
+        setattr(p, 'ls_pos_slack', 1e-6)
+    except Exception:
+        pass
     res = simulate_one(p, long_time=True)
 
     # Fit exponential to decay of ||rho-1||_2
@@ -54,6 +59,7 @@ def run_longrun() -> Dict:
         first_norm=float(res['hist_norm'][0]) if len(res['hist_norm'])>0 else None,
         last_norm=float(res['hist_norm'][-1]) if len(res['hist_norm'])>0 else None,
         fit=fit_clean,
+        hist_norm=[float(x) for x in res['hist_norm']],
     )
     with open('outputs/phase4_unification_enhanced_longrun_v2.json', 'w') as f:
         json.dump(out, f, indent=2)
