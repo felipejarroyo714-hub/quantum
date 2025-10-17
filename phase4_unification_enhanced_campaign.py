@@ -94,6 +94,7 @@ def simulate_one(
     accept_window = int(getattr(p, 'accept_window', 5))
     accept_rel_budget = float(getattr(p, 'accept_window_rel_budget', 5e-6))
     accept_abs_budget = float(getattr(p, 'accept_window_abs_budget', 1e-9))
+    window_end_abs_margin = float(getattr(p, 'window_end_abs_margin', 0.0))
     lambda_Q_decay = float(getattr(p, 'lambda_Q_decay', 1.0))
     window_count = 0
     last_anchor_norm = None
@@ -174,8 +175,9 @@ def simulate_one(
             budget = last_anchor_norm * accept_rel_budget + accept_abs_budget
             is_window_end = ((window_count + 1) % accept_window) == 0
             if is_window_end:
-                enforce_margin = max(last_anchor_norm * getattr(p, 'ls_rel_tol', 1e-6), getattr(p, 'ls_abs_tol', 1e-9))
-                ok = norm_try <= (last_anchor_norm - enforce_margin + getattr(p, 'ls_pos_slack', 0.0))
+                enforce_margin_rel = last_anchor_norm * getattr(p, 'ls_rel_tol', 1e-6)
+                enforce_margin_abs = max(getattr(p, 'ls_abs_tol', 1e-9), window_end_abs_margin)
+                ok = norm_try <= (last_anchor_norm - max(enforce_margin_rel, enforce_margin_abs) + getattr(p, 'ls_pos_slack', 0.0))
             else:
                 ok = norm_try <= (last_anchor_norm + budget)
             if ok:
