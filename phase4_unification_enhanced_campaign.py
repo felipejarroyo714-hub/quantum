@@ -39,6 +39,7 @@ def simulate_one(
     basis_variant: Optional[str] = None,
     ref_profile_variant: Optional[str] = None,
     long_time: bool = False,
+    init_u: Optional[np.ndarray] = None,
 ) -> Dict:
     # Apply overrides
     if overrides:
@@ -56,7 +57,12 @@ def simulate_one(
     assert np.allclose(z0, z)
 
     # Add optional initial noise in u
-    u = np.log(r0.copy())
+    if init_u is not None:
+        # Use provided initial log-profile (must match grid length)
+        assert len(init_u) == len(z), "init_u length must match z grid length"
+        u = init_u.copy()
+    else:
+        u = np.log(r0.copy())
     if noise_std > 0.0:
         rng = np.random.default_rng(42)
         u += rng.normal(scale=noise_std, size=u.shape)
