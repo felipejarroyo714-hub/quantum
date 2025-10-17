@@ -102,8 +102,10 @@ def simulate_one(
     accept_abs_budget = float(getattr(p, 'accept_window_abs_budget', 1e-9))
     window_end_abs_margin = float(getattr(p, 'window_end_abs_margin', 0.0))
     lambda_Q_decay = float(getattr(p, 'lambda_Q_decay', 1.0))
+    smooth_window = int(getattr(p, 'smooth_window', 3))
     window_count = 0
     last_anchor_norm = None
+    prev_norms: List[float] = []
 
     # Iterative relaxation
     for it in range(max_steps):
@@ -175,21 +177,23 @@ def simulate_one(
             rp_try = gradient(r_try, dz)
             rho_try = rp_try / (alpha * np.clip(r_try, 1e-18, None))
             norm_try = float(np.sqrt(np.trapezoid((rho_try - 1.0) ** 2, z)))
-            # Windowed acceptance: allow tiny increases within budget inside window; enforce net descent at window end
+            # Windowed acceptance with cumulative (smoothed) descent metric
             if last_anchor_norm is None:
                 last_anchor_norm = norm_prev
-            budget = last_anchor_norm * accept_rel_budget + accept_abs_budget
+            sm_prev = float(np.mean(prev_norms[-smooth_window:])) if prev_norms else norm_prev
+            budget = sm_prev * accept_rel_budget + accept_abs_budget
             is_window_end = ((window_count + 1) % accept_window) == 0
             if is_window_end:
-                enforce_margin_rel = last_anchor_norm * getattr(p, 'ls_rel_tol', 1e-6)
+                enforce_margin_rel = sm_prev * getattr(p, 'ls_rel_tol', 1e-6)
                 enforce_margin_abs = max(getattr(p, 'ls_abs_tol', 1e-9), window_end_abs_margin)
-                ok = norm_try <= (last_anchor_norm - max(enforce_margin_rel, enforce_margin_abs) + getattr(p, 'ls_pos_slack', 0.0))
+                ok = norm_try <= (sm_prev - max(enforce_margin_rel, enforce_margin_abs) + getattr(p, 'ls_pos_slack', 0.0))
             else:
-                ok = norm_try <= (last_anchor_norm + budget)
+                ok = norm_try <= (sm_prev + budget)
             if ok:
                 u = u_try
                 norm_prev = norm_try
                 accepted = True
+                prev_norms.append(norm_try)
                 if is_window_end:
                     last_anchor_norm = norm_try
                     window_count = 0
