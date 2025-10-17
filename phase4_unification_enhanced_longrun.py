@@ -17,7 +17,7 @@ def run_longrun() -> Dict:
     os.makedirs('outputs', exist_ok=True)
     # Many-step monotone schedule per directive
     p = EnhancedParams(
-        max_iters=24000,
+        max_iters=40000,
         du_cap=0.30,
         ls_rel_tol=2e-5,
         ls_abs_tol=1e-9,
@@ -25,10 +25,10 @@ def run_longrun() -> Dict:
         lambda_Q=0.15,
         dt_init=2e-3,
         dt_min=1e-12,
-        k_eig=14,
+        k_eig=12,
         local_smooth_window=15,
         epsilon0=0.50,
-        num_z=500,
+        num_z=400,
     )
     # Apply tiny positive acceptance slack to avoid numerical pinning
     try:
@@ -49,14 +49,14 @@ def run_longrun() -> Dict:
     )
     pA.kappa *= 0.5
     pA.lambda_R *= 0.5
-    pA.lambda_Q = 0.12
-    setattr(pA, 'lambda_Q_decay', 0.90)
+    pA.lambda_Q = 0.10
+    setattr(pA, 'lambda_Q_decay', 0.88)
     setattr(pA, 'accept_window', 3)
     setattr(pA, 'window_end_abs_margin', 2e-5)
     setattr(pA, 'accept_window_rel_budget', 1e-7)
     setattr(pA, 'smooth_window', 5)
     pA.du_cap = 0.38
-    pA.max_iters = 12000
+    pA.max_iters = 20000
     resA = simulate_one(pA, long_time=True)
 
     # Stage B: restore curvature to nominal and continue from Stage A final state
@@ -66,7 +66,7 @@ def run_longrun() -> Dict:
         k_eig=p.k_eig, local_smooth_window=p.local_smooth_window, epsilon0=p.epsilon0, num_z=p.num_z
     )
     init_u = np.log(resA['r'])
-    # Stage B settings
+    # Stage B settings (chain multiple segments)
     setattr(pB, 'lambda_Q_decay', 0.98)
     setattr(pB, 'accept_window', 3)
     setattr(pB, 'window_end_abs_margin', 2e-5)
@@ -74,10 +74,16 @@ def run_longrun() -> Dict:
     setattr(pB, 'smooth_window', 5)
     pB.du_cap = 0.30
     pB.max_iters = 12000
-    resB = simulate_one(pB, long_time=True, init_u=init_u)
+    # Chain multiple Stage B segments to build a composite curve
+    B_segments = []
+    res_prev_u = init_u
+    for _ in range(3):
+        resBi = simulate_one(pB, long_time=True, init_u=res_prev_u)
+        B_segments.append(resBi)
+        res_prev_u = np.log(resBi['r'])
 
     # Combine histories for fitting/plotting
-    all_hist = np.concatenate([resA['hist_norm'], resB['hist_norm']])
+    all_hist = np.concatenate([resA['hist_norm']] + [seg['hist_norm'] for seg in B_segments])
     res = {'hist_norm': all_hist}
 
     # Fit exponential to decay of ||rho-1||_2
@@ -103,6 +109,8 @@ def run_longrun() -> Dict:
         last_norm=float(all_hist[-1]) if len(all_hist)>0 else None,
         fit=fit_clean,
         hist_norm=[float(x) for x in all_hist],
+        hist_norm_A=[float(x) for x in resA['hist_norm']],
+        hist_norm_B_segments=[[float(x) for x in seg['hist_norm']] for seg in B_segments],
     )
     with open('outputs/phase4_unification_enhanced_longrun_v2.json', 'w') as f:
         json.dump(out, f, indent=2)
