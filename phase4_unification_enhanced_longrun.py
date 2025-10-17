@@ -17,17 +17,18 @@ def run_longrun() -> Dict:
     os.makedirs('outputs', exist_ok=True)
     # Many-step monotone schedule per directive
     p = EnhancedParams(
-        max_iters=800,
-        du_cap=0.10,
-        ls_rel_tol=1e-5,
+        max_iters=1200,
+        du_cap=0.15,
+        ls_rel_tol=2e-5,
         ls_abs_tol=1e-8,
         robust_quantile=0.90,
-        lambda_Q=0.15,
+        lambda_Q=0.20,
         dt_init=2e-3,
         dt_min=1e-9,
-        k_eig=48,
+        k_eig=32,
         local_smooth_window=21,
-        epsilon0=0.10,
+        epsilon0=0.20,
+        num_z=1200,
     )
     res = simulate_one(p, long_time=True)
 
