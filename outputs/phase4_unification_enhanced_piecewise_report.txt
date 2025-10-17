@@ -1,8 +1,8 @@
 Piecewise exponential decay report
 
-Stage A (fast): n=6, A=12113747334.238016, tau=0.20114552501637897, C=1.607805609909066, R2=-7.085687246325736e+25
-Stage B1 (slow): n=2, A=nan, tau=nan, C=nan, R2=nan
-Stage B2 (slow): n=2, A=nan, tau=nan, C=nan, R2=nan
-Stage B3 (slow): n=536, A=14.736385211327711, tau=137.45281414876337, C=1.5736553009149032, R2=-411075.00712353876
+Stage A (fast, single): n=6, A=nan, tau=nan, C=nan, R2=nan
+Stage B1 (slow, single): n=2, A=nan, tau=nan, C=nan, R2=nan
+Stage B2 (slow, single): n=2, A=nan, tau=nan, C=nan, R2=nan
+Stage B3 (slow, single): n=536, A=nan, tau=nan, C=nan, R2=nan
 
 Composite iters=546, first_norm=1.609105004409855, last_norm=1.5736553009149032
