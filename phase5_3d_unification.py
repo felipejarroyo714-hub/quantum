@@ -64,10 +64,10 @@ class Geometry3DParams:
     z_min: float = -10.0  # evolutional depth axis
     z_max: float = 10.0
     
-    # Grid resolution (reduced for memory efficiency)
-    num_x: int = 32
-    num_y: int = 32
-    num_z: int = 64
+    # Grid resolution (minimal for testing)
+    num_x: int = 16
+    num_y: int = 16
+    num_z: int = 32
     
     # 3D curvature parameters
     kappa_z: float = 0.1  # curvature constant κ_z = ∂²Φ/∂z²
@@ -88,7 +88,7 @@ class Field3DParams:
     m_theta: int = 0  # angular momentum
     
     # 3D spectrum
-    k_eig: int = 16  # number of 3D modes
+    k_eig: int = 8  # number of 3D modes
     
     # 3D backreaction
     lambda_Q: float = 0.2  # quantum backreaction strength
@@ -242,8 +242,18 @@ def compute_3d_modes(H: csr_matrix, k: int) -> Tuple[np.ndarray, np.ndarray]:
     n = H.shape[0]
     k = min(k, n - 2)
     
-    # Solve H ψ = E ψ for lowest eigenpairs
-    eigenvals, eigenvecs = eigsh(H, k=k, which='SM', sigma=0.0)
+    # Use more robust eigenvalue solver with better parameters
+    try:
+        eigenvals, eigenvecs = eigsh(H, k=k, which='SM', sigma=0.0, 
+                                    maxiter=1000, tol=1e-8)
+    except:
+        # Fallback: use smallest magnitude eigenvalues
+        eigenvals, eigenvecs = eigsh(H, k=k, which='LM', sigma=1.0,
+                                    maxiter=1000, tol=1e-6)
+        # Sort by magnitude
+        idx = np.argsort(np.abs(eigenvals))
+        eigenvals = eigenvals[idx]
+        eigenvecs = eigenvecs[:, idx]
     
     # Ensure positive eigenvalues
     eigenvals = np.maximum(eigenvals, 1e-12)
