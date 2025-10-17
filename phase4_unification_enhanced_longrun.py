@@ -40,16 +40,41 @@ def run_longrun() -> Dict:
         setattr(p, 'lambda_Q_decay', 0.98)
     except Exception:
         pass
-    res = simulate_one(p, long_time=True)
+    # Stage A: reduce curvature feedback by 50% and stronger λ_Q decay with stricter window end
+    # Copy only dataclass fields
+    pA = EnhancedParams(
+        max_iters=p.max_iters, du_cap=p.du_cap, ls_rel_tol=p.ls_rel_tol, ls_abs_tol=p.ls_abs_tol,
+        robust_quantile=p.robust_quantile, lambda_Q=p.lambda_Q, dt_init=p.dt_init, dt_min=p.dt_min,
+        k_eig=p.k_eig, local_smooth_window=p.local_smooth_window, epsilon0=p.epsilon0, num_z=p.num_z
+    )
+    pA.kappa *= 0.5
+    pA.lambda_R *= 0.5
+    setattr(pA, 'lambda_Q_decay', 0.95)
+    setattr(pA, 'accept_window', 3)
+    setattr(pA, 'window_end_abs_margin', 1e-5)
+    resA = simulate_one(pA, long_time=True)
+
+    # Stage B: restore curvature to nominal and continue from Stage A final state
+    pB = EnhancedParams(
+        max_iters=p.max_iters, du_cap=p.du_cap, ls_rel_tol=p.ls_rel_tol, ls_abs_tol=p.ls_abs_tol,
+        robust_quantile=p.robust_quantile, lambda_Q=p.lambda_Q, dt_init=p.dt_init, dt_min=p.dt_min,
+        k_eig=p.k_eig, local_smooth_window=p.local_smooth_window, epsilon0=p.epsilon0, num_z=p.num_z
+    )
+    init_u = np.log(resA['r'])
+    resB = simulate_one(pB, long_time=True, init_u=init_u)
+
+    # Combine histories for fitting/plotting
+    all_hist = np.concatenate([resA['hist_norm'], resB['hist_norm']])
+    res = {'hist_norm': all_hist}
 
     # Fit exponential to decay of ||rho-1||_2
-    t = np.arange(len(res['hist_norm']), dtype=float)
-    fit = fit_exponential(t, res['hist_norm'])
+    t = np.arange(len(all_hist), dtype=float)
+    fit = fit_exponential(t, all_hist)
 
     # Plot decay
     if len(t) > 0:
         plt.figure(figsize=(6,4))
-        plt.semilogy(t, res['hist_norm'], 'o-', label='||ρ−1||_2')
+        plt.semilogy(t, all_hist, 'o-', label='||ρ−1||_2 (Stage A→B)')
         if np.isfinite(fit.get('tau', float('nan'))):
             A = fit['A']; tau = fit['tau']; C = fit['C']
             plt.semilogy(t, A*np.exp(-t/tau)+C, 'r--', label=f"exp fit τ≈{tau:.2f}")
@@ -60,11 +85,11 @@ def run_longrun() -> Dict:
     # sanitize fit for JSON
     fit_clean = {k: (float(v) if isinstance(v, (np.floating, float)) else (float(v) if hasattr(v, 'item') else v)) for k, v in fit.items()}
     out = dict(
-        iters=int(len(res['hist_norm'])),
-        first_norm=float(res['hist_norm'][0]) if len(res['hist_norm'])>0 else None,
-        last_norm=float(res['hist_norm'][-1]) if len(res['hist_norm'])>0 else None,
+        iters=int(len(all_hist)),
+        first_norm=float(all_hist[0]) if len(all_hist)>0 else None,
+        last_norm=float(all_hist[-1]) if len(all_hist)>0 else None,
         fit=fit_clean,
-        hist_norm=[float(x) for x in res['hist_norm']],
+        hist_norm=[float(x) for x in all_hist],
     )
     with open('outputs/phase4_unification_enhanced_longrun_v2.json', 'w') as f:
         json.dump(out, f, indent=2)
