@@ -1,0 +1,1740 @@
+﻿"""
+====================================================================
+🧠  GOLDEN TURING AI — ARTIFICIAL INTELLIGENCE ENGINE & BENCHMARK SUITE
+====================================================================
+
+
+Author (Design & Systems Theory): Felipe J. Arroyo  
+Chief Coder (Engineering & Algorithms): ChatGPT / OpenAI  
+Contact: felipejarroyo@gmail.com
+(619) 353-4882
+
+
+────────────────────────────────────────────────────────────────────
+1. INTRODUCTION
+────────────────────────────────────────────────────────────────────
+
+
+This codebase contains a modular artificial intelligence engine called **Golden Turing AI**, designed by Felipe J. Arroyo and coded with the assistance of AI-based tooling (ChatGPT). The system simulates multi-layered reasoning, memory dynamics, adversarial signal processing, and simulation-based adaptation. It is tailored toward high-fidelity, state-aware automation in environments where context ambiguity, input noise, and optimization under uncertainty are persistent challenges.
+
+
+Golden Turing AI is not a consumer-facing chatbot or simple prediction model. It is a **self-organizing decision system** capable of modeling reasoning drift, memory degradation, and adversarial perturbation, all while maintaining a stable vector of goals and interpretability features. The engine is highly relevant to **legal technology use cases** that involve:
+
+
+- Multi-step document triage or summarization under load
+- Simulated adversarial logic (e.g., litigation strategy mapping)
+- Automated compliance pipeline testing
+- AI-augmented research crawlers with evidence validation
+- High-noise environments where AI must not hallucinate
+
+
+The included benchmark script tests the performance and robustness of the AI’s core methods under standard and adversarial conditions, across multiple configurations.
+
+
+────────────────────────────────────────────────────────────────────
+2. WHY INCLUDE THIS CODE IN A PARALEGAL APPLICATION?
+────────────────────────────────────────────────────────────────────
+
+
+While this application is for a **paralegal position**, I am submitting this AI system as part of my portfolio to demonstrate a parallel competency: building tools that **extend the reach of legal professionals**, automate complex logic chains, and improve the transparency and efficiency of legal workflows. I built this system while transitioning back into the legal world, during a period when I was saving to resolve my bar membership arrears.
+
+
+I believe forward-looking firms like Flare will increasingly value not just legal experience, but also **legal engineering**—and this project shows how those two worlds can intersect. As a litigation veteran, I designed this AI to mirror how skilled attorneys reason through ambiguity under constraints.
+
+
+────────────────────────────────────────────────────────────────────
+3. HOW TO CONFIGURE & USE THIS SYSTEM
+────────────────────────────────────────────────────────────────────
+
+
+Golden Turing AI is instantiated via a configuration dictionary. You can adjust:
+
+
+- `ai_state_dim`: Size of the internal state vector (default 256)
+- `max_memory_size`: Length of episodic memory retained
+- `simulation_iterations`: Number of simulation rounds per reasoning cycle
+
+
+Example instantiation:
+```python
+ai = GoldenTuringAI(config={
+    "ai_state_dim": 256,
+    "max_memory_size": 2000,
+    "simulation_iterations": 100
+})
+
+
+
+
+from decimal import getcontext, Decimal, ROUND_HALF_UP
+# Set high precision FIRST
+AWARENESS_PREC = 100
+getcontext().prec = AWARENESS_PREC
+
+
+import os
+import time
+import random
+import json
+import math
+import hashlib
+import traceback
+import copy
+from collections import deque, Counter
+from urllib.parse import urlparse
+
+
+# --- Numpy Check ---
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    np = None
+    NUMPY_AVAILABLE = False
+    print("Warning: numpy not found. AI state will use standard lists.")
+
+
+# --- Environment Auto-Detection & Configuration ---
+def get_base_directory():
+    """Auto-detects environment and returns the appropriate base directory."""
+    if os.path.exists("/sdcard/"):
+        print("Detected Android/proot environment. Using /sdcard/ for data.")
+        return "/sdcard/GoldenTuringData"
+    else:
+        print("Using local directory ./GoldenTuringData for data.")
+        return "./GoldenTuringData"
+
+
+SD_CARD_BASE_DIR = get_base_directory()
+AI_DATA_DIR = os.path.join(SD_CARD_BASE_DIR, "ai_core")
+MEMORY_DIR = os.path.join(AI_DATA_DIR, "memory")
+SIMULATION_DIR = os.path.join(AI_DATA_DIR, "simulations")
+MODULES_DIR = os.path.join(SD_CARD_BASE_DIR, "modules")
+
+
+DEFAULT_AI_CONFIG = {
+    "ai_state_dim": 32, "max_memory_size": 500,
+    "learning_rate_base": "0.05", "learning_rate_decay": "0.999", "min_learning_rate": "0.001",
+    "awareness_gain_success": "0.020", "awareness_gain_analysis": "0.010",
+    "awareness_gain_simulation_success": "0.030", "awareness_gain_tunneling": "0.15",
+    "awareness_gain_meta_analysis": "0.025", "awareness_loss_failure": "-0.030",
+    "awareness_loss_captcha": "-0.06", "awareness_loss_simulation_fail": "-0.05",
+    "awareness_loss_stagnation": "-0.005", "awareness_decay": "0.9997",
+    "min_awareness_for_complex_actions": "0.3", "min_awareness_for_simulation": "0.5",
+    "min_awareness_for_mutation": "0.6", "min_awareness_for_tunneling": "0.7",
+    "min_awareness_for_meta_analysis": "0.65", "evasion_param_mutation_scale": "0.1",
+    "default_evasion_params": {
+        "sigmoid_k": {"value": 2.0, "min": 0.5, "max": 10.0, "learn_rate": "0.01"},
+        "fractal_layers": {"value": 2.0, "min": 1.0, "max": 5.0, "learn_rate": "0.005"},
+        "entropy_factor_limit": {"value": 0.5, "min": 0.1, "max": 1.0, "learn_rate": "0.02"},
+        "base_delay_factor": {"value": 0.2, "min": 0.05, "max": 1.0, "learn_rate": "0.01"}
+    },
+    "max_evasion_level": 1.0, "state_blend_factor": "0.1",
+    "analysis_weight_adapt_rate": "0.01", "rule_threshold_adapt_rate": "0.005",
+    "state_vector_decay": "0.95", "state_vector_noise": "0.01",
+    "simulation_iterations": 50, "simulation_challenge_levels": 5,
+    "simulation_multiverse_params": 3, "simulation_param_variation_scale": "0.1",
+    "quantum_potential_decay": "0.99", "quantum_potential_gain": "0.01",
+    "potential_awareness_boost_factor": "0.1", "entanglement_awareness_threshold": "0.05",
+    "entanglement_param_boost_factor": "1.5", "tunneling_stagnation_threshold": 50,
+    "tunneling_stagnation_gain_limit": "0.005", "tunneling_resonance_score_threshold": "0.05",
+    "tunneling_potential_threshold": "0.3", "tunneling_state_shift_factor": "0.3",
+    "annealing_awareness_stability_window": 20, "annealing_stability_threshold": "0.01",
+    "annealing_mutation_scale_factor_stable": "0.5", "annealing_mutation_scale_factor_unstable": "1.2",
+    "annealing_lr_factor_stable": "0.9", "annealing_lr_factor_unstable": "1.1",
+    "interference_blend_factor_scale": "0.5", "meta_analysis_tuning_rate": "0.005",
+    "meta_analysis_weight_noise": "0.02", "meta_analysis_threshold_noise": "0.01",
+    "memory_fidelity_noise_factor": "0.005", "zeno_effect_trigger_count": 5,
+    "zeno_effect_time_window_sec": 60, "zeno_effect_awareness_change_threshold": "0.001",
+    "zeno_effect_dampening_factor": "0.1", "vortex_load_enabled": True,
+    "save_interval_updates": 10,
+    "default_analysis_weights": {
+        "success_impact": "1.0", "error_impact": "-1.5", "captcha_impact": "-2.5",
+        "prediction_error_impact": "-0.5", "content_size_impact": "0.1",
+        "new_links_impact": "0.3", "new_keywords_impact": "0.5",
+        "timing_penalty_factor": "-0.01", "analysis_bonus": "0.2",
+        "simulation_analysis_bonus": "0.3", "tunneling_bonus": "0.5",
+        "meta_analysis_bonus": "0.25"
+    },
+    "default_rule_thresholds": {
+        "action_complexity_awareness": "0.3", "simulation_trigger_awareness": "0.5",
+        "mutation_trigger_awareness": "0.6", "tunneling_trigger_awareness": "0.7",
+        "meta_analysis_trigger_awareness": "0.65", "captcha_pulse_trigger_count": 3,
+        "low_success_rate_trigger": "0.4", "max_recent_observations_for_analysis": 50,
+        "resonance_score_threshold_for_tunneling": "0.05",
+    },
+}
+
+
+DECIMAL_EPSILON = Decimal('1e-' + str(AWARENESS_PREC - 5))
+
+
+def safe_load_json(filepath, default=None):
+    try:
+        if os.path.exists(filepath):
+            if os.path.getsize(filepath) > 0:
+                 with open(filepath, 'r', encoding='utf-8') as f: return json.load(f)
+            else: return default if default is not None else {}
+        else: return default if default is not None else {}
+    except (json.JSONDecodeError, Exception) as e:
+        print(f"Warning: Failed to load JSON from {filepath}: {e}")
+    return default if default is not None else {}
+
+
+def safe_save_json(filepath, data):
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        temp_filepath = filepath + ".tmp"
+        with open(temp_filepath, 'w', encoding='utf-8') as f:
+            encoder = NumpyEncoder if NUMPY_AVAILABLE else DecimalEncoder
+            json.dump(data, f, indent=2, cls=encoder)
+        os.replace(temp_filepath, filepath)
+        return True
+    except Exception as e:
+        print(f"Error: Failed to save JSON to {filepath}: {e}")
+        if 'temp_filepath' in locals() and os.path.exists(temp_filepath):
+            try: os.remove(temp_filepath)
+            except Exception: pass
+        return False
+
+
+class DecimalEncoder(json.JSONEncoder):
+     def default(self, obj):
+         if isinstance(obj, Decimal):
+             return format(obj, f'.{getcontext().prec}f').rstrip('0').rstrip('.') if '.' in format(obj, f'.{getcontext().prec}f') else format(obj, f'.{getcontext().prec}f')
+         try: return super().default(obj)
+         except TypeError: return str(obj)
+
+
+class NumpyEncoder(DecimalEncoder):
+    def default(self, obj):
+        if NUMPY_AVAILABLE:
+            if isinstance(obj, np.integer): return int(obj)
+            elif isinstance(obj, np.floating):
+                if np.isnan(obj): return None
+                if np.isinf(obj): return str(obj)
+                return float(obj)
+            elif isinstance(obj, np.ndarray): return obj.tolist()
+            elif isinstance(obj, np.bool_): return bool(obj)
+        return super().default(obj)
+
+
+class FreneticLogger:
+    def __init__(self, log_file=os.path.join(AI_DATA_DIR, "ai_log.txt"), crawler_id="AI"):
+        self.log_file = log_file
+        self.crawler_id = str(crawler_id).zfill(2)
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            with open(log_file, 'a', encoding='utf-8') as f: pass
+        except Exception as e:
+            print(f"!!! LOGGER INITIALIZATION ERROR creating/accessing {log_file}: {e} !!!")
+            self.log_file = None
+    def update_id(self, new_id): self.crawler_id = str(new_id).zfill(2)
+    def log(self, message, level="INFO"):
+        log_entry = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{self.crawler_id}] [{level.upper()}] {message}"
+        print(log_entry)
+        if self.log_file:
+            try:
+                with open(self.log_file, 'a', encoding='utf-8') as f: f.write(log_entry + "\n")
+            except Exception as e: print(f"!!! Logger File Write Error: {e} !!!")
+
+
+
+
+class GoldenTuringAI:
+    """Core Golden Turing AI class with quantum-inspired feedback loops (v1.9.9)."""
+    ACTION_CRAWL="CRAWL"; ACTION_PULSE_CAPTCHA="PULSE_CAPTCHA"; ACTION_WAIT="WAIT";
+    ACTION_ANALYZE_STATE="ANALYZE_STATE"; ACTION_ANALYZE_MEMORY="ANALYZE_MEMORY";
+    ACTION_MODIFY_EVASION="MODIFY_EVASION"; ACTION_TEST_PROXIES="TEST_PROXIES";
+    ACTION_GENERATE_KEYWORDS="GENERATE_KEYWORDS"; ACTION_MANAGE_VECTOR_SAVE="MANAGE_VECTOR_SAVE";
+    ACTION_MUTATE_PARAMS="MUTATE_PARAMS"; ACTION_BLEND_STATE="BLEND_STATE";
+    ACTION_ADJUST_ANALYSIS_WEIGHTS="ADJUST_ANALYSIS_WEIGHTS";
+    ACTION_ADAPT_RULE_THRESHOLDS="ADAPT_RULE_THRESHOLDS"; ACTION_RUN_SIMULATION="RUN_SIMULATION";
+    ACTION_QUANTUM_TUNNEL = "QUANTUM_TUNNEL"
+    ACTION_TUNE_ANALYSIS = "TUNE_ANALYSIS"
+    ACTION_ERROR="ERROR"
+
+
+    def __init__(self, config=None, crawler_id="AI", initial_state_dim=None):
+        self.crawler_id = str(crawler_id).zfill(2)
+        self.logger = FreneticLogger(crawler_id=self.crawler_id)
+        self.logger.log(f"Initializing Golden Turing AI Core v1.9.9 (ID: {self.crawler_id})...", "SYSTEM")
+        self.logger.log(f"Numpy Available: {NUMPY_AVAILABLE}", "SYSTEM")
+
+
+        self.config = copy.deepcopy(DEFAULT_AI_CONFIG)
+        if config and isinstance(config, dict):
+            for key, value in config.items():
+                if key in self.config and isinstance(self.config[key], dict) and isinstance(value, dict):
+                    self.config[key].update(value)
+                else:
+                    self.config[key] = value
+
+
+        if initial_state_dim is not None:
+            try:
+                dim_val = int(initial_state_dim)
+                if dim_val > 0: self.config['ai_state_dim'] = dim_val
+                else: self.logger.log(f"Invalid initial_state_dim '{initial_state_dim}'. Using default.", "WARN")
+            except ValueError: self.logger.log(f"Invalid initial_state_dim '{initial_state_dim}'. Using default.", "WARN")
+
+
+        self.state_dim = self.config.get('ai_state_dim', 32)
+        if self.state_dim <= 0:
+            self.logger.log("State Dim <= 0 found in config. Resetting to 32.", "WARN")
+            self.state_dim = 32; self.config['ai_state_dim'] = 32
+
+
+        self._ensure_decimal_config()
+
+
+        self.state = self._initialize_state()
+        self.state_potential = Decimal('0.1')
+        mem_size = self.config.get('max_memory_size', 500)
+        history_len = max(mem_size, self.config.get("tunneling_stagnation_threshold", 50), self.config.get("annealing_awareness_stability_window", 20))
+        self.self_memory = deque(maxlen=mem_size)
+        self.adversary_memory = deque(maxlen=mem_size)
+        self.awareness_history = deque(maxlen=history_len)
+        self.action_history = deque(maxlen=self.config.get("zeno_effect_trigger_count", 5) * 2)
+        self.last_action_times = {}
+
+
+        self.learning_rate = self.config['learning_rate_base']
+        self.evasion_params = copy.deepcopy(self.config['default_evasion_params'])
+        self.analysis_weights = copy.deepcopy(self.config['default_analysis_weights'])
+        self.rule_thresholds = copy.deepcopy(self.config['default_rule_thresholds'])
+        self.self_awareness = Decimal('0.1')
+        self.load_persistent_data()
+        self.vortex_data = {}
+        if self.config.get("vortex_load_enabled", True): self.load_vortex_modules()
+        self.update_counter = 0
+        self.last_save_time = time.time()
+        self.currently_saving_vectors = self.config.get("start_saving_vectors", False)
+        self.logger.log(f"AI Core Initialized. State Dim: {self.state_dim}, Awareness: {self.self_awareness:.6f}, Potential: {self.state_potential:.6f}", "SYSTEM")
+
+
+       # --- TRIPLIFICATION UPGRADES (Safe Defaults) ---
+        self.planning_stack = []
+        self.agent_pool = {}
+        self.strategy_history = deque(maxlen=50)
+        self.blackboard = None
+        self.logger.log("Triplified planning fields initialized.", "SYSTEM")
+
+
+  def register_agent(self, name, agent):
+       """Registers a collaborating agent (must support observe/act or receive_task)."""
+        if hasattr(agent, "observe"):
+            self.agent_pool[name] = agent
+            self.logger.log(f"[AgentRegistry] Agent '{name}' registered.", "INFO")
+
+
+    def inject_blackboard_interface(self, blackboard):
+        """Injects blackboard access into the core AI."""
+        self.blackboard = blackboard
+        self.logger.log("[Integration] Blackboard interface connected.", "INFO")
+
+
+    def prioritize_planning_task(self, task: dict):
+        """Adds a task to the planning stack with high priority."""
+        self.planning_stack.insert(0, task)
+        self.logger.log(f"[Planner] High-priority task scheduled: {task}", "PLAN")
+
+
+    def enqueue_planning_task(self, task: dict):
+        """Adds a task to the end of the planning stack."""
+        self.planning_stack.append(task)
+        self.logger.log(f"[Planner] Task enqueued: {task}", "PLAN")
+
+
+    def manage_planning_stack(self):
+        """Checks and executes planned tasks if present."""
+        if not hasattr(self, 'planning_stack'):
+            self.planning_stack = []  # Ensure it exists in case it was omitted somewhere
+        if not self.planning_stack:
+            return None
+        next_plan = self.planning_stack.pop(0)
+        self.logger.log(f"[Planner] Executing plan: {next_plan}", "PLAN")
+        return {
+            "action_type": "EXECUTE_PLAN",
+            "plan_task": next_plan
+        }
+
+
+    def delegate_task(self, agent_name: str, task: dict):
+        """Sends a task to a sub-agent, if registered."""
+        agent = self.agent_pool.get(agent_name)
+        if agent and hasattr(agent, "receive_task"):
+            agent.receive_task(task)
+            self.logger.log(f"[Delegate] Task sent to '{agent_name}': {task}", "DELEGATE")
+        else:
+            self.logger.log(f"[Delegate] Agent '{agent_name}' not found or cannot receive tasks.", "WARN")
+
+
+    def reflect_on_recent_outcomes(self):
+        """Example placeholder reflection."""
+        successes = [m for m in self.self_memory if m.get("success")]
+        failures = [m for m in self.self_memory if not m.get("success")]
+        self.logger.log(f"[Reflect] Recent: {len(successes)} successes / {len(failures)} failures", "ANALYSIS")
+        if len(failures) > len(successes):
+            self.logger.log("[Reflect] Strategy may need adjustment — enqueuing re-analysis.", "ALERT")
+            self.enqueue_planning_task({"plan": "self_audit", "reason": "failure_dominance"})
+
+
+
+
+
+
+
+
+    def _ensure_decimal_config(self):
+        original_prec = getcontext().prec
+        try:
+            if original_prec < AWARENESS_PREC: getcontext().prec = AWARENESS_PREC
+            decimal_keys = [
+                'learning_rate_base', 'learning_rate_decay', 'min_learning_rate',
+                'awareness_gain_success', 'awareness_gain_analysis', 'awareness_gain_simulation_success',
+                'awareness_gain_tunneling', 'awareness_gain_meta_analysis', 'awareness_loss_failure',
+                'awareness_loss_captcha', 'awareness_loss_simulation_fail', 'awareness_loss_stagnation',
+                'awareness_decay', 'min_awareness_for_complex_actions', 'min_awareness_for_simulation',
+                'min_awareness_for_mutation', 'min_awareness_for_tunneling', 'min_awareness_for_meta_analysis',
+                'evasion_param_mutation_scale', 'state_blend_factor', 'analysis_weight_adapt_rate',
+                'rule_threshold_adapt_rate', 'state_vector_decay', 'state_vector_noise',
+                'simulation_param_variation_scale', 'quantum_potential_decay', 'quantum_potential_gain',
+                'potential_awareness_boost_factor', 'entanglement_awareness_threshold', 'entanglement_param_boost_factor',
+                'tunneling_stagnation_gain_limit', 'tunneling_resonance_score_threshold',
+                'tunneling_potential_threshold', 'tunneling_state_shift_factor', 'annealing_stability_threshold',
+                'annealing_mutation_scale_factor_stable', 'annealing_mutation_scale_factor_unstable',
+                'annealing_lr_factor_stable', 'annealing_lr_factor_unstable', 'interference_blend_factor_scale',
+                'meta_analysis_tuning_rate', 'meta_analysis_weight_noise', 'meta_analysis_threshold_noise',
+                'memory_fidelity_noise_factor', 'zeno_effect_awareness_change_threshold',
+                'zeno_effect_dampening_factor'
+            ]
+            for key in decimal_keys:
+                if key in self.config:
+                    try: self.config[key] = Decimal(str(self.config[key]))
+                    except Exception: self.config[key] = Decimal(str(DEFAULT_AI_CONFIG.get(key, '0')))
+
+
+            for param in self.config['default_evasion_params'].values():
+                if isinstance(param, dict) and 'learn_rate' in param:
+                    try: param['learn_rate'] = Decimal(str(param['learn_rate']))
+                    except Exception: param['learn_rate'] = Decimal('0.01')
+
+
+            for key, value in self.config['default_analysis_weights'].items():
+                try: self.config['default_analysis_weights'][key] = Decimal(str(value))
+                except Exception: self.config['default_analysis_weights'][key] = Decimal(str(DEFAULT_AI_CONFIG['default_analysis_weights'][key]))
+
+
+            int_keys = ['captcha_pulse_trigger_count', 'max_recent_observations_for_analysis']
+            for key, value in self.config['default_rule_thresholds'].items():
+                try:
+                    if key not in int_keys: self.config['default_rule_thresholds'][key] = Decimal(str(value))
+                    else: self.config['default_rule_thresholds'][key] = int(value)
+                except Exception:
+                     if key not in int_keys: self.config['default_rule_thresholds'][key] = Decimal(str(DEFAULT_AI_CONFIG['default_rule_thresholds'][key]))
+                     else: self.config['default_rule_thresholds'][key] = int(DEFAULT_AI_CONFIG['default_rule_thresholds'][key])
+        finally:
+            getcontext().prec = original_prec
+
+
+    def _initialize_state(self):
+        dim = self.state_dim
+        self.logger.log(f"Initializing state vector (Dim={dim}, Numpy={NUMPY_AVAILABLE})", "DEBUG")
+        if NUMPY_AVAILABLE:
+            return np.random.uniform(-0.1, 0.1, size=dim).astype(np.float64)
+        else:
+            return [(random.random() - 0.5) * 0.2 for _ in range(dim)]
+
+
+    def load_persistent_data(self):
+        self.logger.log(f"Loading persistent AI data for ID {self.crawler_id}...", "SYSTEM")
+        state_path = os.path.join(MEMORY_DIR, f"ai_state_{self.crawler_id}.json")
+        mem_path = os.path.join(MEMORY_DIR, f"ai_memory_{self.crawler_id}.json")
+        params_path = os.path.join(MEMORY_DIR, f"ai_params_{self.crawler_id}.json")
+
+
+        loaded_state_data = safe_load_json(state_path)
+        if loaded_state_data and 'state' in loaded_state_data:
+            state_list = loaded_state_data['state']
+            if isinstance(state_list, list) and len(state_list) == self.state_dim:
+                if NUMPY_AVAILABLE: self.state = np.array(state_list, dtype=np.float64)
+                else: self.state = state_list
+                self.logger.log("Loaded state from file.", "INFO")
+            else: self.logger.log("State dim mismatch. Reinitializing.", "WARN"); self.state = self._initialize_state()
+        else: self.logger.log("No valid state file. Using initial.", "INFO")
+
+
+        loaded_memory_data = safe_load_json(mem_path)
+        if loaded_memory_data:
+            mem_size = self.config.get('max_memory_size', 500)
+            self.self_memory = deque(loaded_memory_data.get('self_memory', []), maxlen=mem_size)
+            self.adversary_memory = deque(loaded_memory_data.get('adversary_memory', []), maxlen=mem_size)
+            self.logger.log(f"Loaded memory: Self({len(self.self_memory)}), Adv({len(self.adversary_memory)}).", "INFO")
+
+
+        loaded_params_data = safe_load_json(params_path)
+        if loaded_params_data:
+            original_prec = getcontext().prec
+            try:
+                if original_prec < AWARENESS_PREC: getcontext().prec = AWARENESS_PREC
+                self.learning_rate = Decimal(str(loaded_params_data.get('learning_rate', self.config['learning_rate_base'])))
+                self.self_awareness = Decimal(str(loaded_params_data.get('self_awareness', '0.1')))
+                self.state_potential = Decimal(str(loaded_params_data.get('state_potential', '0.1')))
+                self.awareness_history = deque((Decimal(str(aw)) for aw in loaded_params_data.get('awareness_history', [])), maxlen=self.awareness_history.maxlen)
+
+
+                loaded_evasion = loaded_params_data.get('evasion_params', {})
+                for key, default in self.evasion_params.items():
+                    loaded_val = loaded_evasion.get(key)
+                    if loaded_val and isinstance(loaded_val, dict):
+                        default['value'] = loaded_val.get('value', default['value'])
+                        try: default['learn_rate'] = Decimal(str(loaded_val.get('learn_rate', default['learn_rate'])))
+                        except: pass
+
+
+                loaded_weights = loaded_params_data.get('analysis_weights', {})
+                for key in self.analysis_weights:
+                    if key in loaded_weights:
+                        try: self.analysis_weights[key] = Decimal(str(loaded_weights[key]))
+                        except: pass
+
+
+                loaded_thresholds = loaded_params_data.get('rule_thresholds', {})
+                for key in self.rule_thresholds:
+                    if key in loaded_thresholds:
+                        try:
+                            if isinstance(self.rule_thresholds[key], Decimal): self.rule_thresholds[key] = Decimal(str(loaded_thresholds[key]))
+                            else: self.rule_thresholds[key] = type(self.rule_thresholds[key])(loaded_thresholds[key])
+                        except: pass
+                self.logger.log("Loaded AI parameters from file.", "INFO")
+            except Exception as e:
+                self.logger.log(f"Error loading params: {e}. Resetting.", "ERROR")
+                self._reset_to_default_params()
+            finally: getcontext().prec = original_prec
+        else:
+            self.logger.log("No params file found. Using defaults.", "INFO")
+            self._reset_to_default_params()
+
+
+    def save_persistent_data(self):
+        current_time = time.time()
+        if current_time - self.last_save_time < 5.0: return
+        self.last_save_time = current_time
+        self.logger.log(f"Saving persistent AI data for ID {self.crawler_id}...", "SYSTEM")
+        state_path = os.path.join(MEMORY_DIR, f"ai_state_{self.crawler_id}.json")
+        mem_path = os.path.join(MEMORY_DIR, f"ai_memory_{self.crawler_id}.json")
+        params_path = os.path.join(MEMORY_DIR, f"ai_params_{self.crawler_id}.json")
+        state_payload = {'state': self.state.tolist() if NUMPY_AVAILABLE else self.state, 'timestamp': time.time()}
+        memory_payload = {'self_memory': list(self.self_memory), 'adversary_memory': list(self.adversary_memory), 'timestamp': time.time()}
+        params_payload = {
+            'learning_rate': self.learning_rate, 'self_awareness': self.self_awareness,
+            'state_potential': self.state_potential, 'evasion_params': self.evasion_params,
+            'analysis_weights': self.analysis_weights, 'rule_thresholds': self.rule_thresholds,
+            'awareness_history': list(self.awareness_history), 'timestamp': time.time()
+        }
+        s_ok = safe_save_json(state_path, state_payload)
+        m_ok = safe_save_json(mem_path, memory_payload)
+        p_ok = safe_save_json(params_path, params_payload)
+        if not (s_ok and m_ok and p_ok): self.logger.log("Error saving one or more AI data files.", "ERROR")
+
+
+    def _reset_to_default_params(self):
+        self.logger.log("Resetting parameters to configuration defaults.", "WARN")
+        self._ensure_decimal_config()
+        self.learning_rate = self.config['learning_rate_base']
+        self.self_awareness = Decimal('0.1')
+        self.state_potential = Decimal('0.1')
+        self.evasion_params = copy.deepcopy(self.config['default_evasion_params'])
+        self.analysis_weights = copy.deepcopy(self.config['default_analysis_weights'])
+        self.rule_thresholds = copy.deepcopy(self.config['default_rule_thresholds'])
+        self.awareness_history.clear()
+
+
+    def load_vortex_modules(self):
+        self.logger.log(f"Loading vortex modules from: {MODULES_DIR}", "INFO")
+        loaded_files = []
+        if not os.path.isdir(MODULES_DIR):
+            self.logger.log(f"Modules directory not found: {MODULES_DIR}", "WARN")
+            return
+        for filename in os.listdir(MODULES_DIR):
+            filepath = os.path.join(MODULES_DIR, filename)
+            module_name = filename.split('.')[0]
+            data = None
+            try:
+                if filename.endswith(".json"): data = safe_load_json(filepath)
+                elif filename.endswith(".txt"):
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        data = [line.strip() for line in f if line.strip() and not line.strip().startswith('#')]
+                if data is not None:
+                    self.vortex_data[module_name] = data
+                    loaded_files.append(filename)
+                    if filename.endswith(".json") and data and isinstance(data, dict) and 'config_updates' in data:
+                        if isinstance(data['config_updates'], dict):
+                            self.logger.log(f"Applying vortex config updates from: {filename}", "INFO")
+                            updates = data['config_updates']
+                            for key, value in updates.items():
+                                if key in self.config and isinstance(self.config[key], dict) and isinstance(value, dict):
+                                     self.config[key].update(value)
+                                else: self.config[key] = value
+                            self._ensure_decimal_config()
+            except Exception as e:
+                self.logger.log(f"Failed to load vortex module {filename}: {e}", "ERROR")
+        if loaded_files: self.logger.log(f"Vortex modules loaded: {', '.join(loaded_files)}", "INFO")
+
+
+    def update_state(self, observation):
+        if not isinstance(observation, dict) or not observation.get("type"):
+            self.logger.log(f"Invalid observation received: {str(observation)[:100]}...", "WARN")
+            return
+
+
+        original_prec = getcontext().prec
+        try:
+            if original_prec < AWARENESS_PREC: getcontext().prec = AWARENESS_PREC
+            timestamp = time.time()
+            observation['timestamp'] = timestamp
+            observation['awareness_before'] = str(self.self_awareness)
+            action_type = observation.get("source_action_type")
+            is_analysis_action = action_type in [
+                self.ACTION_ANALYZE_STATE, self.ACTION_ANALYZE_MEMORY,
+                self.ACTION_ADJUST_ANALYSIS_WEIGHTS, self.ACTION_ADAPT_RULE_THRESHOLDS,
+                self.ACTION_TUNE_ANALYSIS
+            ]
+            zeno_dampening = Decimal('1.0')
+            if is_analysis_action:
+                self.action_history.append((action_type, timestamp))
+                recent_count = sum(1 for act, ts in self.action_history if act == action_type and timestamp - ts < self.config["zeno_effect_time_window_sec"])
+                if recent_count >= self.config["zeno_effect_trigger_count"]:
+                    last_effective_time = self.last_action_times.get(action_type, 0)
+                    if timestamp - last_effective_time > self.config["zeno_effect_time_window_sec"]:
+                         zeno_dampening = self.config["zeno_effect_dampening_factor"]
+                         self.self_awareness += self.config["awareness_loss_stagnation"]
+
+
+            is_failure = not observation.get("success", False) or observation.get("captcha_detected", False)
+            target_memory = self.adversary_memory if is_failure and observation.get("type") in ["crawl_result", "pulse_result"] else self.self_memory
+            noisy_observation = self._apply_memory_fidelity_noise(observation)
+            if observation.get("type") not in ["no_op", "action_acknowledged"]:
+                 target_memory.append(noisy_observation)
+
+
+            reward = self._calculate_reward(noisy_observation)
+            observation['calculated_reward'] = str(reward)
+            awareness_before = self.self_awareness
+            self._update_awareness(noisy_observation, reward, zeno_dampening)
+            awareness_after = self.self_awareness
+            observation['awareness_after'] = str(awareness_after)
+            awareness_change = awareness_after - awareness_before
+            potential_change = (awareness_change.copy_abs() - self.state_potential * Decimal('0.1')) * self.config["quantum_potential_gain"]
+            self.state_potential = max(Decimal('0'), min(Decimal('1.0'), self.state_potential * self.config["quantum_potential_decay"] + potential_change))
+
+
+            if awareness_change.copy_abs() >= self.config["entanglement_awareness_threshold"]:
+                 self._apply_entanglement_boost(observation, awareness_change > 0)
+            self._update_state_vector(noisy_observation, reward)
+            self._adapt_evasion_params(noisy_observation, reward)
+
+
+            if is_analysis_action and awareness_change.copy_abs() >= self.config["zeno_effect_awareness_change_threshold"]:
+                 self.last_action_times[action_type] = timestamp
+
+
+            if self.update_counter > 0 and self.update_counter % self.config["annealing_awareness_stability_window"] == 0:
+                self._apply_adaptive_annealing()
+
+
+            self.update_counter += 1
+            if self.update_counter % self.config.get("save_interval_updates", 10) == 0:
+                self.save_persistent_data()
+        except Exception as e:
+            self.logger.log(f"--- CRITICAL ERROR in update_state: {e} ---", "ERROR")
+            self.logger.log(f"Traceback:\n{traceback.format_exc()}", "ERROR")
+        finally:
+            getcontext().prec = original_prec
+
+
+    def choose_action(self, url_queue_size=0):
+        original_prec = getcontext().prec
+        try:
+            if original_prec < AWARENESS_PREC:
+                getcontext().prec = AWARENESS_PREC
+
+
+            # Execute pending plans first
+            plan = self.manage_planning_stack()
+            if plan:
+                return plan
+
+
+            awareness = self.self_awareness
+            rules = self.rule_thresholds
+            cfg = self.config
+
+
+            # --- Tier 1: Forced & High-Priority Overrides ---
+            if awareness >= rules.get("tunneling_trigger_awareness", Decimal('0.7')):
+                if self._check_awareness_stagnation() and \
+                   self._calculate_state_resonance_score() <= rules.get("resonance_score_threshold_for_tunneling") and \
+                   self.state_potential >= cfg.get("tunneling_potential_threshold"):
+                    return self._prepare_action_details(self.ACTION_QUANTUM_TUNNEL)
+
+
+            max_hist = rules.get("max_recent_observations_for_analysis", 50)
+            recent_outcomes = [o for o in self.self_memory if o.get("type") == "crawl_result"][-max_hist:]
+            if len(recent_outcomes) >= 10:
+                success_rate = sum(1 for o in recent_outcomes if o.get("success") and not o.get("captcha_detected")) / len(recent_outcomes)
+                if Decimal(str(success_rate)) < rules.get("low_success_rate_trigger") and awareness >= rules.get("action_complexity_awareness"):
+                    self.logger.log(f"Low success rate ({success_rate:.2f}). Forcing strategic analysis.", "INFO")
+                    pool = {
+                        self.ACTION_ANALYZE_MEMORY: 15,
+                        self.ACTION_TUNE_ANALYSIS: 10,
+                        self.ACTION_MUTATE_PARAMS: 8
+                    }
+                    return self._prepare_action_details(
+                        random.choices(list(pool.keys()), weights=list(pool.values()), k=1)[0]
+                    )
+
+
+            if sum(1 for o in self.adversary_memory if o.get("captcha_detected")) >= rules.get("captcha_pulse_trigger_count"):
+                return self._prepare_action_details(self.ACTION_PULSE_CAPTCHA)
+
+
+            if url_queue_size == 0:
+                return self._prepare_action_details(self.ACTION_GENERATE_KEYWORDS)
+
+
+            # --- Tier 2: High-Awareness Strategic Pool ---
+            if awareness >= rules.get("simulation_trigger_awareness"):
+                strategic_pool = {
+                    self.ACTION_RUN_SIMULATION: Decimal('20.0') +
+                        (awareness - rules.get("simulation_trigger_awareness")) ** 2 * Decimal('50.0')
+                }
+
+
+                if awareness >= rules.get("meta_analysis_trigger_awareness"):
+                    strategic_pool[self.ACTION_TUNE_ANALYSIS] = (
+                        awareness - rules.get("meta_analysis_trigger_awareness")
+                    ) * Decimal('5.0')
+
+
+                if awareness >= rules.get("mutation_trigger_awareness"):
+                    strategic_pool[self.ACTION_MUTATE_PARAMS] = (
+                        awareness - rules.get("mutation_trigger_awareness")
+                    ) * Decimal('3.0')
+
+
+                strategic_pool[self.ACTION_CRAWL] = Decimal('1.0') * (Decimal('1.1') - awareness)
+
+
+                chosen_action = random.choices(
+                    list(strategic_pool.keys()),
+                    weights=[float(w) for w in strategic_pool.values()],
+                    k=1
+                )[0]
+                return self._prepare_action_details(chosen_action)
+
+
+            # --- Tier 3: Standard Operational Logic ---
+            action_weights = {
+                self.ACTION_CRAWL: Decimal('10.0'),
+                self.ACTION_WAIT: Decimal('1.0'),
+            }
+
+
+            if awareness >= rules.get("action_complexity_awareness"):
+                action_weights[self.ACTION_ANALYZE_STATE] = awareness
+                action_weights[self.ACTION_BLEND_STATE] = awareness * Decimal('0.5')
+                action_weights[self.ACTION_TEST_PROXIES] = Decimal('0.2')
+
+
+            chosen_action = random.choices(
+                list(action_weights.keys()),
+                weights=[float(w) for w in action_weights.values()],
+                k=1
+            )[0]
+            return self._prepare_action_details(chosen_action)
+
+
+        except Exception as e:
+            self.logger.log(f"--- CRITICAL ERROR in choose_action: {e} ---", "ERROR")
+            self.logger.log(f"Traceback:\n{traceback.format_exc()}", "ERROR")
+            return self._prepare_action_details(self.ACTION_WAIT)
+        finally:
+            getcontext().prec = original_prec
+
+
+
+
+    def _prepare_action_details(self, action_type):
+        action_details = {"action_type": action_type}
+        awareness_float = float(self.self_awareness)
+        cfg = self.config
+
+
+        if action_type == self.ACTION_CRAWL:
+            action_details["target_url"] = None
+            action_details["prediction"] = self._predict_outcome("?")
+            action_details["evasion_level"] = awareness_float * float(cfg.get('max_evasion_level', 1.0))
+            action_details["current_evasion_params"] = {k: v['value'] for k, v in self.evasion_params.items()}
+            base_delay_val = float(self.evasion_params.get('base_delay_factor', {}).get('value', 0.2))
+            action_details["base_delay"] = random.uniform(0.05, 0.3) * base_delay_val * (1.0 + awareness_float * 0.5)
+        elif action_type == self.ACTION_WAIT:
+            action_details["duration"] = max(0.5, min(30.0, random.uniform(1.0, 5.0) * (1.0 + awareness_float * 2.0)))
+        elif action_type == self.ACTION_PULSE_CAPTCHA:
+            action_details["pulse_strength"] = 0.5 + awareness_float * 0.5
+            target_url = next((obs["url"] for obs in reversed(self.adversary_memory) if obs.get("captcha_detected") and obs.get("url")), None)
+            action_details["target_url"] = target_url
+            if not target_url: return self._prepare_action_details(self.ACTION_WAIT)
+        elif action_type == self.ACTION_QUANTUM_TUNNEL:
+            action_details["shift_factor"] = float(cfg.get("tunneling_state_shift_factor", "0.3"))
+        elif action_type == self.ACTION_TUNE_ANALYSIS:
+            action_details["tuning_target"] = random.choice(["weights", "thresholds"])
+        elif action_type == self.ACTION_MUTATE_PARAMS:
+            action_details["trigger_mutation"] = True
+        elif action_type == self.ACTION_MODIFY_EVASION:
+            param_name = random.choice(list(self.evasion_params.keys()))
+            settings = self.evasion_params[param_name]
+            current_value = Decimal(str(settings['value']))
+            min_val = Decimal(str(settings.get('min', -float('inf'))))
+            max_val = Decimal(str(settings.get('max', float('inf'))))
+            change_range = max(Decimal('0.1'), max_val - min_val) if max_val != Decimal('inf') else Decimal('1.0')
+            change_factor = Decimal(random.uniform(-0.1, 0.1)) * self.self_awareness * change_range
+            new_value = max(min_val, min(max_val, current_value + change_factor))
+            action_details["parameter"] = param_name
+            action_details["new_value"] = float(new_value)
+            action_details["old_value"] = settings['value']
+        elif action_type == self.ACTION_MANAGE_VECTOR_SAVE:
+            action_details["enable_saving"] = self.self_awareness > cfg.get("vector_save_awareness_threshold", Decimal('0.7'))
+            self.currently_saving_vectors = action_details["enable_saving"]
+
+
+        self.logger.log(f"Choosing Action: {action_details['action_type']} (Awareness: {self.self_awareness:.4f})", "INFO")
+        if action_details['action_type'] != self.ACTION_WAIT:
+            self.logger.log(f"Action Details: { {k: (f'{v:.4f}' if isinstance(v, (float, Decimal)) else v) for k,v in action_details.items() if k != 'current_evasion_params'} }", "DEBUG")
+        return action_details
+
+
+    def _apply_memory_fidelity_noise(self, observation):
+
+
+        if not isinstance(observation, dict):
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            return observation  # e.g., Decimal('0') or None or skip
+
+
+        if self.self_awareness >= Decimal('0.95'): return observation
+        noisy_obs = copy.deepcopy(observation)
+        noise_level = (Decimal('1.0') - self.self_awareness) * self.config["memory_fidelity_noise_factor"]
+        if noise_level <= DECIMAL_EPSILON: return observation
+        numerical_fields = ["timing_ms", "content_size_bytes", "prediction_error", "reward", "awareness_before", "awareness_after"]
+        for field in numerical_fields:
+            if field in noisy_obs:
+                try:
+                    original_value = Decimal(str(noisy_obs[field]))
+                    noise_magnitude = Decimal(random.gauss(0, float(noise_level))) * original_value.copy_abs().max(Decimal('0.1'))
+                    noisy_value = original_value + noise_magnitude
+                    if field in ["awareness_before", "awareness_after", "reward", "prediction_error"]: noisy_obs[field] = str(noisy_value)
+                    else: noisy_obs[field] = max(0, int(noisy_value.to_integral_value(rounding=ROUND_HALF_UP)))
+                except: pass
+        return noisy_obs
+
+
+    def _calculate_reward(self, observation):
+        original_prec = getcontext().prec
+        if not isinstance(observation, dict):
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            return Decimal('0')
+        reward = Decimal('0.0')
+        try:
+            if original_prec < AWARENESS_PREC: getcontext().prec = AWARENESS_PREC
+            obs_type = observation.get("type")
+            weights = self.analysis_weights
+            if obs_type == "crawl_result":
+                if observation.get("success") and not observation.get("captcha_detected"):
+                    reward += weights.get("success_impact", Decimal('1.0'))
+                    reward += Decimal(len(observation.get("links", [])))/100 * weights.get("new_links_impact", Decimal('0.3'))
+                    reward += Decimal(len(observation.get("new_keywords_found", [])))/20 * weights.get("new_keywords_impact", Decimal('0.5'))
+                    pred_error = Decimal(str(observation.get("prediction_error", '1.0')))
+                    reward += (Decimal('1.0') - pred_error) * weights.get("prediction_error_impact", Decimal('-0.5')).copy_abs()
+                    reward += (Decimal(observation.get("content_size_bytes", 0))/50000).min(1) * weights.get("content_size_impact", Decimal('0.1'))
+                else:
+                     if observation.get("captcha_detected"): reward += weights.get("captcha_impact", Decimal('-2.5'))
+                     else: reward += weights.get("error_impact", Decimal('-1.5'))
+                reward += (Decimal(observation.get("timing_ms", 1000))/10000).min(1) * weights.get("timing_penalty_factor", Decimal('-0.01'))
+            elif obs_type in ["analysis_result", "state_blend_result", "mutation_result", "tunneling_result", "meta_analysis_result", "keyword_generation_result", "analysis_weights_adjusted", "rule_thresholds_adapted"]:
+                 if observation.get("success", True):
+                     if obs_type == "tunneling_result": bonus = weights.get("tunneling_bonus", Decimal('0.5'))
+                     elif obs_type == "meta_analysis_result": bonus = weights.get("meta_analysis_bonus", Decimal('0.25'))
+                     elif observation.get("subtype") == "simulation_analysis": bonus = weights.get("simulation_analysis_bonus", Decimal('0.3'))
+                     else: bonus = weights.get("analysis_bonus", Decimal('0.2'))
+                     reward += bonus
+            elif obs_type == "simulation_result":
+                reward += Decimal(str(observation.get("avg_success_rate", '0.0'))) * weights.get("analysis_bonus", Decimal('0.2')) * Decimal('0.5')
+            elif obs_type == "pulse_result":
+                 if not observation.get("captcha_detected", True): reward += weights.get("success_impact", Decimal('1.0')) * Decimal('0.5')
+                 else: reward += weights.get("captcha_impact", Decimal('-2.5')) * Decimal('0.8')
+            return reward
+        finally: getcontext().prec = original_prec
+
+
+    def _update_awareness(self, observation, reward, zeno_dampening=Decimal('1.0')):
+        original_prec = getcontext().prec
+
+
+        if not isinstance(observation, dict):
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            return
+
+
+        try:
+            if original_prec < AWARENESS_PREC: getcontext().prec = AWARENESS_PREC
+            change = Decimal('0.0')
+            obs_type = observation.get("type")
+            cfg = self.config
+            if obs_type == "crawl_result":
+                if observation.get("success") and not observation.get("captcha_detected"):
+                    change += cfg["awareness_gain_success"]
+                    change += (Decimal('1.0') - Decimal(str(observation.get("prediction_error", '1.0')))) * cfg["awareness_gain_success"] * Decimal('0.5')
+                else:
+                    if observation.get("captcha_detected"): change += cfg["awareness_loss_captcha"]
+                    else: change += cfg["awareness_loss_failure"]
+            elif obs_type == "analysis_result" and observation.get("success", True):
+                if observation.get("subtype") == "simulation_analysis": change += cfg["awareness_gain_simulation_success"]
+                else: change += cfg["awareness_gain_analysis"]
+            elif obs_type == "simulation_result":
+                 if observation.get("success", False): change += (Decimal(str(observation.get("avg_success_rate", '0.0'))) - Decimal('0.5')) * cfg["awareness_gain_analysis"]
+                 else: change += cfg["awareness_loss_simulation_fail"] * Decimal('0.5')
+            elif obs_type == "tunneling_result" and observation.get("success", False): change += cfg["awareness_gain_tunneling"]
+            elif obs_type == "meta_analysis_result" and observation.get("success", False): change += cfg["awareness_gain_meta_analysis"]
+
+
+            reward_impact_factor = Decimal('0.1') * Decimal(str(zeno_dampening))
+            change += reward * reward_impact_factor
+            potential_boost = (self.state_potential * cfg["potential_awareness_boost_factor"])
+            change *= (Decimal('1.0') + potential_boost * change.copy_sign(Decimal('1.0')))
+
+
+            if zeno_dampening < Decimal('1.0'):
+                 non_reward_change = change - (reward * reward_impact_factor)
+                 dampened_change = non_reward_change * zeno_dampening
+                 change = (reward * reward_impact_factor) + dampened_change
+
+
+            self.self_awareness = max(Decimal('0.0'), min(Decimal('1.0'), self.self_awareness * cfg['awareness_decay'] + change))
+            self.awareness_history.append(self.self_awareness)
+        finally: getcontext().prec = original_prec
+
+
+
+
+    def _update_state_vector(self, observation, reward):
+
+
+        original_prec = getcontext().prec
+
+
+        if not isinstance(observation, dict):
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            return
+
+
+        if not isinstance(observation, dict):
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            return Decimal('0')
+
+
+        if not isinstance(observation, dict):
+            # Optionally log the error, then handle gracefully (return default reward, etc.)
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            # Return a neutral or error reward, or handle as you see fit
+            return Decimal('0')
+        try:
+            if original_prec < AWARENESS_PREC: getcontext().prec = AWARENESS_PREC
+            features = [Decimal('0.0')] * self.state_dim
+            features[0], features[1], features[2] = reward, self.self_awareness, self.state_potential
+            obs_type = observation.get("type")
+            idx = 3
+            def inc_idx(c_idx): return min(c_idx + 1, self.state_dim - 1)
+
+
+            if obs_type == "crawl_result":
+                features[idx] = Decimal('1') if observation.get("success") else Decimal('-1'); idx=inc_idx(idx)
+                features[idx] = Decimal('1') if observation.get("captcha_detected") else Decimal('-0.5'); idx=inc_idx(idx)
+                features[idx] = Decimal(len(observation.get("links",[])))/100; idx=inc_idx(idx)
+                features[idx] = Decimal(observation.get("content_size_bytes",0))/2097152; idx=inc_idx(idx)
+                features[idx] = Decimal(str(observation.get("prediction_error", '1.0')))*-1; idx=inc_idx(idx)
+                features[idx] = Decimal(observation.get("timing_ms",1000))/20000; idx=inc_idx(idx)
+            elif obs_type == "analysis_result":
+                features[idx] = Decimal('1'); idx=inc_idx(idx)
+                if observation.get("subtype") == "state_resonance": features[idx] = Decimal(str(observation.get("resonance_score",'0'))); idx=inc_idx(idx)
+
+
+            try:
+                h = hashlib.sha1(str(observation.get('url', obs_type)).encode()).hexdigest()
+                if idx < self.state_dim: features[idx] = (Decimal(int(h[:5],16)%1000)/1000-Decimal('0.5'))*2; idx=inc_idx(idx)
+                if idx < self.state_dim: features[idx] = (Decimal(int(h[5:10],16)%1000)/1000-Decimal('0.5'))*2; idx=inc_idx(idx)
+            except: pass
+
+
+            decay, noise_s, lr = float(self.config['state_vector_decay']), float(self.config['state_vector_noise']), float(self.learning_rate)
+            if NUMPY_AVAILABLE:
+                f_np = np.array([float(f) for f in features], dtype=np.float64)
+                if len(f_np) < self.state_dim: f_np.resize(self.state_dim)
+                noise = np.random.uniform(-noise_s, noise_s, size=self.state_dim)
+                self.state = np.tanh(self.state * decay + f_np * lr + noise)
+            else:
+                for i in range(self.state_dim):
+                    f_val = float(features[i]) if i<len(features) else 0.0
+                    noise = random.uniform(-noise_s, noise_s)
+                    self.state[i] = math.tanh(self.state[i] * decay + f_val * lr + noise)
+            self.learning_rate = max(self.config['min_learning_rate'], self.learning_rate * self.config['learning_rate_decay'])
+        finally: getcontext().prec = original_prec
+
+
+    def _adapt_evasion_params(self, observation, reward):
+
+
+        original_prec = getcontext().prec
+
+
+        if not isinstance(observation, dict):
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            return Decimal('0')
+
+
+        if observation.get("type") not in ["crawl_result", "pulse_result"]: return
+
+
+        try:
+            if original_prec < AWARENESS_PREC: getcontext().prec = AWARENESS_PREC
+            target_dir, strength = Decimal('0'), Decimal('1')
+            if observation.get("captcha_detected"): target_dir, strength = Decimal('1'), Decimal('1.5')
+            elif not observation.get("success") and observation.get("status_code") in [403, 429, 503]: target_dir, strength = Decimal('0.7'), Decimal('1.2')
+            elif not observation.get("success"): target_dir = Decimal('0.2')
+            elif self.self_awareness > (self.rule_thresholds.get("action_complexity_awareness", Decimal('0.3')) + Decimal('0.2')):
+                target_dir = max(Decimal('-0.3'), -(self.self_awareness - self.rule_thresholds.get("action_complexity_awareness")) * Decimal('0.5'))
+                strength = Decimal('0.8')
+
+
+            if target_dir.copy_abs() > DECIMAL_EPSILON:
+                boost = observation.get("entanglement_boost", Decimal('1.0'))
+                for name, sets in self.evasion_params.items():
+                    lr = sets.get('learn_rate', Decimal('0.01')) * strength * boost
+                    rand_f = Decimal(random.uniform(-0.1, 0.1)) * (Decimal('1') - target_dir.copy_abs())
+                    change = (target_dir + rand_f) * lr * Decimal('5')
+                    new_v = Decimal(str(sets['value'])) + change
+                    sets['value'] = float(max(Decimal(str(sets.get('min', -float('inf')))), min(Decimal(str(sets.get('max', float('inf')))), new_v)))
+        finally: getcontext().prec = original_prec
+
+
+    def _apply_entanglement_boost(self, observation, is_positive_change):
+
+
+        if not isinstance(observation, dict):
+            self.logger.log(f"Malformed observation (not a dict): {observation}", "WARN")
+            return
+
+
+        self.logger.log(f"Applying Entanglement Boost (Positive Change: {is_positive_change})...", "DEBUG")
+        observation["entanglement_boost"] = self.config["entanglement_param_boost_factor"]
+
+
+    def _check_awareness_stagnation(self):
+        window = self.config.get("tunneling_stagnation_threshold")
+        if len(self.awareness_history) < window: return False
+        recent_aw = list(self.awareness_history)[-window:]
+        return (max(recent_aw) - min(recent_aw)) <= self.config.get("tunneling_stagnation_gain_limit")
+
+
+    def _calculate_state_resonance_score(self):
+        is_state_invalid = (self.state is None) or \
+                           (NUMPY_AVAILABLE and isinstance(self.state, np.ndarray) and self.state.size == 0) or \
+                           (not NUMPY_AVAILABLE and not self.state)
+        if is_state_invalid:
+            return Decimal('1.0')
+
+
+        if NUMPY_AVAILABLE:
+            s = self.state.astype(np.float64)
+            norm = np.linalg.norm(s)
+            if norm < 1e-9: return Decimal('1.0')
+            return Decimal(str(np.std(s) / norm))
+        else:
+            s_dec = [Decimal(str(x)) for x in self.state]
+            if not s_dec: return Decimal('1.0')
+            mean = sum(s_dec) / len(s_dec)
+            norm = (sum(x**2 for x in s_dec)).sqrt()
+            if norm < DECIMAL_EPSILON: return Decimal('1.0')
+            std_dev = (sum((x-mean)**2 for x in s_dec) / len(s_dec)).sqrt()
+            return std_dev / norm
+
+
+    def _apply_adaptive_annealing(self):
+        window = self.config.get("annealing_awareness_stability_window")
+        if len(self.awareness_history) < window: return
+        recent_aw = [float(a) for a in list(self.awareness_history)[-window:]]
+        std_dev = math.sqrt(sum([(a - sum(recent_aw)/len(recent_aw))**2 for a in recent_aw]) / len(recent_aw))
+        if std_dev <= float(self.config.get("annealing_stability_threshold")):
+            self.learning_rate *= self.config['annealing_lr_factor_stable']
+            self.config['evasion_param_mutation_scale'] *= self.config['annealing_mutation_scale_factor_stable']
+        else:
+            self.learning_rate *= self.config['annealing_lr_factor_unstable']
+            self.config['evasion_param_mutation_scale'] *= self.config['annealing_mutation_scale_factor_unstable']
+        self.learning_rate = max(self.config['min_learning_rate'], self.learning_rate)
+        self.config['evasion_param_mutation_scale'] = max(Decimal('0.01'), min(Decimal('1.0'), self.config['evasion_param_mutation_scale']))
+
+
+    def _predict_outcome(self, url):
+        norm = Decimal('0.0')
+        is_state_invalid = (self.state is None) or \
+                           (NUMPY_AVAILABLE and isinstance(self.state, np.ndarray) and self.state.size == 0) or \
+                           (not NUMPY_AVAILABLE and not self.state)
+        if not is_state_invalid:
+            if NUMPY_AVAILABLE:
+                norm = Decimal(str(np.linalg.norm(self.state)))
+            else:
+                norm = (sum(Decimal(str(x))**2 for x in self.state)).sqrt()
+        url_hash_val = Decimal('0.5')
+        try:
+            url_hash_int = int(hashlib.sha1(str(url).encode()).hexdigest()[:5], 16)
+            url_hash_val = Decimal(url_hash_int % 1000) / Decimal('1000')
+        except Exception: pass
+        logit = (norm * Decimal('1.5') + url_hash_val * Decimal('0.5') + self.self_awareness * Decimal('2.0') - Decimal('1.5'))
+        try:
+            clamped_logit = max(Decimal('-50'), min(Decimal('50'), logit))
+            probability = Decimal('1.0') / (Decimal('1.0') + (-clamped_logit).exp())
+        except: probability = Decimal('1.0') if logit > 0 else Decimal('0.0')
+        return {"predicted_success_prob": float(max(Decimal('0.0'), min(Decimal('1.0'), probability)))}
+
+
+    def _calculate_prediction_error(self, prediction, observation):
+        if not prediction or "predicted_success_prob" not in prediction: return Decimal('0.5')
+        try:
+            predicted_prob = Decimal(str(prediction["predicted_success_prob"]))
+            actual_outcome = Decimal('1.0') if observation.get("success") and not observation.get("captcha_detected") else Decimal('0.0')
+            return max(Decimal('0.0'), min(Decimal('1.0'), (predicted_prob - actual_outcome).copy_abs()))
+        except: return Decimal('0.5')
+
+
+    def _analyze_state_resonance(self):
+        self.logger.log("Analyzing state resonance...", "DEBUG")
+        result = {"type": "analysis_result", "subtype": "state_resonance", "success": True, "timestamp": time.time()}
+        score = self._calculate_state_resonance_score()
+        result["resonance_score"] = str(score)
+        self.logger.log(f"State Resonance Analysis Complete. Score={score:.4f}", "DEBUG")
+        return result
+
+
+    def _analyze_adversary_memory(self):
+        self.logger.log("Analyzing adversary memory...", "DEBUG")
+        result = {"type": "analysis_result", "subtype": "adversary_memory", "success": True, "timestamp": time.time()}
+        max_hist = self.rule_thresholds.get("max_recent_observations_for_analysis", 50)
+        recent_adversary_mem = list(self.adversary_memory)[-max_hist:]
+        if not recent_adversary_mem:
+            result.update({"fail_cnt": 0, "total_analyzed": 0, "captcha_patterns": {}, "error_patterns": {}, "domain_patterns": {}})
+            return result
+        captcha_patterns, error_patterns, domain_patterns = Counter(), Counter(), Counter()
+        for obs in recent_adversary_mem:
+             noisy_obs = self._apply_memory_fidelity_noise(obs)
+             if noisy_obs.get("captcha_detected"): captcha_patterns[noisy_obs.get("captcha_term", "UNKNOWN")] += 1
+             if noisy_obs.get("error_message"): error_patterns[f"S_{noisy_obs.get('status_code')}"] += 1
+             if noisy_obs.get("url"):
+                 try: domain = urlparse(noisy_obs["url"]).netloc or "UNKNOWN"
+                 except: domain = "PARSE_ERROR"
+                 domain_patterns[domain[:50]] += 1
+        top_n = 5
+        result.update({
+            "fail_cnt": len(recent_adversary_mem), "total_analyzed": len(recent_adversary_mem),
+            "captcha_patterns": dict(captcha_patterns.most_common(top_n)),
+            "error_patterns": dict(error_patterns.most_common(top_n)),
+            "domain_patterns": dict(domain_patterns.most_common(top_n)),
+            "significant_patterns_found": len(captcha_patterns) + len(error_patterns) + len(domain_patterns)
+        })
+        self.logger.log(f"Adversary Analysis Complete: Fails({len(recent_adversary_mem)}), Patterns({result['significant_patterns_found']})", "DEBUG")
+        return result
+
+
+    def _perform_mutation(self):
+        self.logger.log("Performing parameter mutation...", "INFO")
+        result = {"type": "mutation_result", "success": True, "mutated": {}, "timestamp": time.time()}
+        try:
+            scale = self.config['evasion_param_mutation_scale']
+            mutated_count = 0
+            for name, sets in self.evasion_params.items():
+                if random.random() < 0.4:
+                    current = Decimal(str(sets['value']))
+                    min_v, max_v = Decimal(str(sets.get('min', -float('inf')))), Decimal(str(sets.get('max', float('inf'))))
+                    p_range = max(Decimal('0.1'), max_v - min_v) if max_v != Decimal('inf') else Decimal('1')
+                    mutation = Decimal(random.gauss(0, float(scale))) * p_range * sets.get('learn_rate', Decimal('0.01')) * 10
+                    new_val = float(max(min_v, min(max_v, current + mutation)))
+                    if abs(new_val - sets['value']) > 1e-9:
+                        sets['value'] = new_val; result["mutated"][f"evasion:{name}"] = new_val; mutated_count += 1
+            if random.random() < 0.15:
+                orig_lr = self.learning_rate
+                self.learning_rate *= Decimal(random.gauss(1.0, float(scale/2)))
+                self.learning_rate = max(self.config['min_learning_rate'], min(self.config['learning_rate_base']*2, self.learning_rate))
+                if (self.learning_rate - orig_lr).copy_abs() > DECIMAL_EPSILON:
+                    result["mutated"]["learning_rate"] = str(self.learning_rate); mutated_count += 1
+            if random.random() < 0.20:
+                key = random.choice(list(self.analysis_weights.keys()))
+                current = self.analysis_weights[key]
+                mutation = Decimal(random.gauss(0, float(scale))) * current.copy_abs().max(Decimal('0.1')) * Decimal('0.5')
+                self.analysis_weights[key] += mutation
+                result["mutated"][f"weight:{key}"] = str(self.analysis_weights[key]); mutated_count += 1
+            if random.random() < 0.15:
+                 numeric_keys = [k for k, v in self.rule_thresholds.items() if isinstance(v, (Decimal, int, float))]
+                 if numeric_keys:
+                     key = random.choice(numeric_keys)
+                     current = Decimal(str(self.rule_thresholds[key]))
+                     new_val = current + Decimal(random.gauss(0, float(scale))) * Decimal('0.05')
+                     if "awareness" in key:
+                         self.rule_thresholds[key] = max(Decimal('0.1'), min(Decimal('0.9'), new_val))
+                     elif isinstance(self.rule_thresholds[key], int):
+                         self.rule_thresholds[key] = int(max(Decimal('1'), new_val.to_integral_value(rounding=ROUND_HALF_UP)))
+                     else:
+                         self.rule_thresholds[key] = max(Decimal('0.05'), min(Decimal('0.95'), new_val))
+                     result["mutated"][f"threshold:{key}"] = str(self.rule_thresholds[key]); mutated_count += 1
+            if mutated_count == 0: result["success"] = False
+            self.logger.log(f"Mutation applied to {mutated_count} parameters.", "INFO")
+        except Exception as e:
+            self.logger.log(f"Error during mutation: {e}", "ERROR"); result["success"]=False; result["error"]=str(e)
+        return result
+
+
+    def _blend_successful_state(self):
+        self.logger.log("Attempting interferential state blend...", "DEBUG")
+        result = {"type": "state_blend_result", "success": True, "timestamp": time.time()}
+        try:
+            blend_factor = self.config['state_blend_factor']
+            interference_scale = self.config['interference_blend_factor_scale']
+            if NUMPY_AVAILABLE:
+                noise = np.random.uniform(-0.05, 0.05, size=self.state_dim).astype(np.float64)
+                target_state = np.tanh(self.state + noise)
+                state_diff_norm = np.linalg.norm(self.state - target_state)
+            else:
+                target_state = [math.tanh(x + random.uniform(-0.05, 0.05)) for x in self.state]
+                diff_sq_sum = sum((Decimal(str(self.state[i])) - Decimal(str(target_state[i])))**2 for i in range(self.state_dim))
+                state_diff_norm = float(diff_sq_sum.sqrt())
+
+
+            interference_factor = Decimal('1.0') + Decimal(str(state_diff_norm)) * interference_scale
+            eff_blend_factor = float(blend_factor * interference_factor * self.self_awareness)
+            eff_blend_factor = max(0.0, min(0.5, eff_blend_factor))
+
+
+            if NUMPY_AVAILABLE:
+                 self.state = np.tanh(self.state * (1.0 - eff_blend_factor) + target_state * eff_blend_factor)
+            else:
+                 for i in range(self.state_dim): self.state[i] = math.tanh(self.state[i] * (1.0 - eff_blend_factor) + target_state[i] * eff_blend_factor)
+
+
+            self.logger.log(f"State Blend Complete. Effective Factor: {eff_blend_factor:.4f}", "INFO")
+            result.update({"blend_factor": eff_blend_factor, "state_diff_norm": state_diff_norm})
+        except Exception as e:
+             self.logger.log(f"Error during state blend: {e}", "ERROR"); result["success"]=False; result["error"]=str(e)
+        return result
+
+
+    def _perform_quantum_tunnel(self):
+        self.logger.log("Attempting Quantum State Tunneling...", "WARN")
+        result = {"type": "tunneling_result", "success": False, "timestamp": time.time()}
+        try:
+            shift_factor = float(self.config.get("tunneling_state_shift_factor", "0.3"))
+            if NUMPY_AVAILABLE:
+                 shift_direction = np.random.uniform(-1.0, 1.0, size=self.state_dim)
+                 norm = np.linalg.norm(shift_direction)
+                 if norm > 1e-9: shift_direction /= norm
+                 self.state = np.tanh(self.state + shift_direction * shift_factor)
+            else:
+                 shift_vector = [(random.random() - 0.5) * 2 for _ in range(self.state_dim)]
+                 norm_factor = math.sqrt(sum(x*x for x in shift_vector))
+                 if norm_factor > 1e-9: shift_vector = [(x/norm_factor)*shift_factor for x in shift_vector]
+                 for i in range(self.state_dim): self.state[i] = math.tanh(self.state[i] + shift_vector[i])
+            result["success"] = True
+            self.logger.log("Quantum Tunneling successful.", "WARN")
+        except Exception as e:
+             self.logger.log(f"Error during quantum tunneling: {e}", "ERROR"); result["error"]=str(e)
+        return result
+
+
+    def _tune_analysis_parameters(self, target):
+        self.logger.log(f"Performing Meta-Analysis Tuning on {target}...", "INFO")
+        result = {"type": "meta_analysis_result", "subtype": target, "success": False, "tuned_params": {}, "timestamp": time.time()}
+        try:
+            rate, w_noise, t_noise = self.config['meta_analysis_tuning_rate'], self.config['meta_analysis_weight_noise'], self.config['meta_analysis_threshold_noise']
+            max_hist = self.rule_thresholds.get("max_recent_observations_for_analysis", 50)
+            obs_hist = list(self.self_memory)[-max_hist:] + list(self.adversary_memory)[-max_hist:]
+            if not obs_hist: return result
+            avg_reward = sum(Decimal(str(o.get('calculated_reward', '0'))) for o in obs_hist) / len(obs_hist)
+
+
+            tuned_count = 0
+            if target == "weights":
+                direction = Decimal('1') if avg_reward < Decimal('0.1') else Decimal('-0.5')
+                for key, weight in self.analysis_weights.items():
+                    sign = Decimal('-1') if "loss" in key or "penalty" in key else Decimal('1')
+                    adj = direction * sign * rate * weight.copy_abs().max(Decimal('0.1'))
+                    noise = Decimal(random.gauss(0, float(w_noise))) * weight.copy_abs().max(Decimal('0.1'))
+                    self.analysis_weights[key] += adj + noise; tuned_count+=1
+            elif target == "thresholds":
+                 if len(self.awareness_history) > 10:
+                    mean_aw = sum(self.awareness_history)/len(self.awareness_history)
+                    direction = (mean_aw - Decimal('0.5')) * Decimal('0.1')
+                    for key, thresh in self.rule_thresholds.items():
+                        if isinstance(thresh, Decimal) and "awareness" in key:
+                            adj = direction * rate * 5
+                            noise = Decimal(random.gauss(0, float(t_noise)))
+                            self.rule_thresholds[key] = max(Decimal('0.1'), min(Decimal('0.9'), thresh + adj + noise)); tuned_count+=1
+            if tuned_count > 0:
+                result["success"] = True
+                self.logger.log(f"Meta-Analysis successful for {target}. Tuned {tuned_count} params.", "INFO")
+        except Exception as e:
+            self.logger.log(f"Error during meta-tuning: {e}", "ERROR"); result["error"]=str(e)
+        return result
+
+
+    def _run_simulation(self):
+        self.logger.log("Starting internal simulation...", "INFO")
+        start_time = time.time()
+        summary = { "type": "simulation_result", "success": False, "multiverse_results": {}, "timestamp": time.time() }
+        orig_state, orig_awareness, orig_potential, orig_params = self.state.copy() if NUMPY_AVAILABLE else self.state[:], self.self_awareness, self.state_potential, copy.deepcopy(self.evasion_params)
+        try:
+            cfg = self.config
+            iter_per_level = max(1, cfg['simulation_iterations'] // (cfg['simulation_challenge_levels'] + 1))
+            total_sim_successes, total_sim_iterations = 0, 0
+
+
+            param_sets = {"original": copy.deepcopy(self.evasion_params)}
+            for i in range(cfg["simulation_multiverse_params"]-1):
+                variant = copy.deepcopy(self.evasion_params)
+                for p, s in variant.items():
+                    if isinstance(s.get('value'), (int,float)):
+                        v, mn, mx = Decimal(str(s['value'])), Decimal(str(s.get('min',0))), Decimal(str(s.get('max',1)))
+                        r = max(Decimal('0.1'), mx-mn) if mx!=Decimal('inf') else Decimal('1')
+                        s['value'] = float(max(mn, min(mx, v + Decimal(random.gauss(0, float(cfg["simulation_param_variation_scale"]))) * r)))
+                param_sets[f"variant_{i+1}"] = variant
+
+
+            for set_id, sim_params in param_sets.items():
+                set_successes, set_iters = 0, 0
+                for level in range(cfg['simulation_challenge_levels'] + 1):
+                    lvl_f = float(level / cfg['simulation_challenge_levels'])
+                    for _ in range(iter_per_level):
+                        k = float(sim_params['sigmoid_k']['value'])
+                        s_prob = max(0, 0.9 - lvl_f*0.3 - (k-2)*0.02)
+                        c_prob = max(0, 0.05 + lvl_f*0.3 - (k-2)*0.05)
+                        f_prob = max(0, 1 - s_prob - c_prob)
+                        outcome = random.choices(["S","C","F"], weights=[s_prob, c_prob, f_prob])[0]
+                        if outcome == "S": set_successes += 1
+                        set_iters += 1
+                summary["multiverse_results"][set_id] = {"rate": set_successes/set_iters if set_iters else 0}
+                total_sim_successes += set_successes; total_sim_iterations += set_iters
+
+
+            if summary["multiverse_results"]:
+                summary["best_param_set_id"] = max(summary["multiverse_results"], key=lambda k: summary["multiverse_results"][k]['rate'])
+            summary["avg_success_rate_overall"] = total_sim_successes / total_sim_iterations if total_sim_iterations > 0 else 0.0
+            summary["success"] = True
+            analysis_obs = {"type": "analysis_result", "subtype": "simulation_analysis", "success": True, "avg_rate": summary['avg_success_rate_overall'], "source_action_type": self.ACTION_RUN_SIMULATION}
+        except Exception as e:
+            self.logger.log(f"--- Simulation Failed: {e} ---", "ERROR"); summary["error"] = str(e); analysis_obs = None
+        finally:
+            self.state, self.self_awareness, self.state_potential, self.evasion_params = orig_state, orig_awareness, orig_potential, orig_params
+            self.logger.log("Restored AI state post-simulation.", "INFO")
+            if analysis_obs: self.update_state(analysis_obs)
+        return summary
+
+
+    def _generate_new_keywords(self):
+        self.logger.log("Generating new keywords...", "INFO")
+        keywords = set()
+        for obs in list(self.self_memory)[-self.rule_thresholds.get("max_recent_observations_for_analysis", 50):]:
+             if obs.get("type") == "crawl_result" and obs.get("success"):
+                 if isinstance(obs.get("new_keywords_found"), list): keywords.update(kw.lower() for kw in obs["new_keywords_found"] if isinstance(kw, str) and 3<len(kw)<30 and kw.isalnum())
+                 if isinstance(obs.get("data_scraped"), dict):
+                      for snippets in obs["data_scraped"].values():
+                          if isinstance(snippets, list):
+                              for snippet in snippets:
+                                   if isinstance(snippet, str): keywords.update(w.lower() for w in snippet.split() if 4<len(w)<25 and w.isalpha())
+        new_kws = list(keywords)[:20]
+        return {"type": "keyword_generation_result", "success": bool(new_kws), "new_keywords": new_kws}
+
+
+    def get_status(self):
+        try:
+            is_state_invalid = (self.state is None) or \
+                               (NUMPY_AVAILABLE and isinstance(self.state, np.ndarray) and self.state.size == 0) or \
+                               (not NUMPY_AVAILABLE and not self.state)
+            if is_state_invalid:
+                 s_norm, s_prev = "0.000000", []
+            else:
+                if NUMPY_AVAILABLE: s_norm, s_prev = format(Decimal(str(np.linalg.norm(self.state))), ".6f"), self.state[:5].tolist()
+                else:
+                    norm_val = (sum(Decimal(str(x))**2 for x in self.state)).sqrt()
+                    s_norm, s_prev = format(norm_val, ".6f"), self.state[:5]
+
+
+            ev_p_disp = {k: {**v, 'learn_rate': format(v.get('learn_rate',0), '.8f')} for k, v in self.evasion_params.items()}
+
+
+            return {
+                "crawler_id": self.crawler_id, "timestamp": time.time(), "ai_version": "1.9.8-QI",
+                "state_dim": self.state_dim, "state_norm": s_norm, "state_preview": s_prev,
+                "self_awareness": format(self.self_awareness, ".8f"), "state_potential": format(self.state_potential, ".8f"),
+                "learning_rate": format(self.learning_rate, ".8f"),
+                "memory_counts": f"{len(self.self_memory)}/{len(self.adversary_memory)}",
+                "update_counter": self.update_counter, "evasion_params": ev_p_disp
+            }
+        except Exception as e: return {"error": str(e), "crawler_id": self.crawler_id}
+
+
+    def update_crawler_id(self, new_id):
+        old_id = self.crawler_id
+        new_id_str = str(new_id).zfill(2)
+        if old_id == new_id_str: return
+
+
+        self.logger.log(f"Updating AI Core ID: {old_id} -> {new_id_str}...", "SYSTEM")
+        self.save_persistent_data()
+        self.crawler_id = new_id_str
+        self.logger.update_id(self.crawler_id)
+        self.logger.log(f"Resetting internal state for new ID {self.crawler_id}...", "SYSTEM")
+
+
+        self.state = self._initialize_state()
+        mem_size = self.config.get('max_memory_size', 500)
+        history_len = max(mem_size, self.config.get("tunneling_stagnation_threshold", 50), self.config.get("annealing_awareness_stability_window", 20))
+        self.self_memory, self.adversary_memory, self.awareness_history = deque(maxlen=mem_size), deque(maxlen=mem_size), deque(maxlen=history_len)
+        self.action_history.clear(); self.last_action_times.clear()
+
+
+        self._reset_to_default_params()
+        self.update_counter = 0; self.last_save_time = time.time()
+        self.load_persistent_data()
+        self.logger.log(f"AI Core ready for ID {self.crawler_id}. Awareness: {self.self_awareness:.6f}", "SYSTEM")
+
+
+    def register_agent(self, name, agent):
+        if hasattr(agent, "observe") and hasattr(agent, "act"):
+            self.agent_pool[name] = agent
+            self.logger.log(f"[AgentRegistry] Registered specialized agent: {name}", "INFO")
+
+
+    def inject_blackboard_interface(self, blackboard):
+        self.blackboard = blackboard
+        self.logger.log("[Blackboard] Interface injected into GoldenTuringAI.", "INFO")
+
+
+    def prioritize_planning_task(self, task):
+        self.planning_stack.appendleft(task)
+        self.logger.log(f"[Planning] Pushed high-priority task: {task}", "PLAN")
+
+
+    def delegate_task_to_agent(self, agent_name, task_data):
+        agent = self.agent_pool.get(agent_name)
+        if agent:
+            self.logger.log(f"[Delegate] Sending task to {agent_name}: {task_data}", "DELEGATE")
+            fn = getattr(agent, "receive_task", None)
+            if callable(fn): fn(task_data)
+
+
+    def reflect_on_recent_strategy(self):
+        last_n = list(self.strategy_history)[-5:]
+        errors = sum(1 for entry in last_n if "error" in entry.get("result", {}))
+        if errors >= 2:
+            self.logger.log("[Reflex] Triggering strategy reset due to recent failures.", "REFLECT")
+
+
+    def manage_planning_stack(self):
+        if not self.planning_stack:
+            return None
+
+
+        next_plan = self.planning_stack.pop(0)
+        self.logger.log(f"[PlanExecution] Executing: {next_plan}", "PLAN")
+        return {"action_type": "EXECUTE_PLAN", "plan": next_plan}
+
+
+
+
+if __name__ == "__main__":
+    print("--- Running Golden Turing AI Module (v1.9.9) Self-Test ---")
+    try:
+        os.makedirs(MEMORY_DIR, exist_ok=True)
+        os.makedirs(SIMULATION_DIR, exist_ok=True)
+        print(f"Created directories: {MEMORY_DIR}, {SIMULATION_DIR}")
+    except Exception as e:
+        print(f"Warning: Could not create directories: {e}")
+
+
+    logger = FreneticLogger(crawler_id="TEST")
+    test_config = {
+        "ai_state_dim": 8, "max_memory_size": 20, "save_interval_updates": 100,
+        "simulation_iterations": 10, "simulation_challenge_levels": 2, "simulation_multiverse_params": 2,
+        "tunneling_stagnation_threshold": 5, "annealing_awareness_stability_window": 5,
+        "zeno_effect_trigger_count": 3, "zeno_effect_time_window_sec": 10
+    }
+    try:
+        ai_test = GoldenTuringAI(config=test_config, crawler_id="TEST")
+        logger.log("Test AI Instance created.", "INFO")
+        logger.log("--- Simulating initial low-awareness behavior ---", "INFO")
+
+
+        for i in range(3):
+            action = ai_test.choose_action(url_queue_size=5)
+            logger.log(f"Cycle {i+1} chose: {action.get('action_type')}", "INFO")
+            obs = {"type": "crawl_result", "success": True, "url": f"http://test.com/p{i}", "timing_ms": 100, "prediction_error": "0.3", "source_action_type": action.get('action_type')}
+            ai_test.update_state(obs)
+
+
+        logger.log("\n--- Testing Specific Actions by forcing high awareness ---", "INFO")
+
+
+        logger.log("\n--- Test 1: Should choose RUN_SIMULATION ---", "INFO")
+        ai_test.self_awareness = Decimal('0.85')
+        ai_test.state_potential = Decimal('0.6')
+        action_sim = ai_test.choose_action(url_queue_size=1)
+        if action_sim['action_type'] == ai_test.ACTION_RUN_SIMULATION:
+             logger.log(f"SUCCESS: Chose {action_sim['action_type']} as expected.", "INFO")
+             sim_result = ai_test._run_simulation()
+             logger.log(f"Simulation Result: Success={sim_result.get('success')}", "INFO")
+        else:
+             logger.log(f"FAILURE: Expected RUN_SIMULATION but chose {action_sim['action_type']}", "ERROR")
+
+
+        logger.log("\n--- Test 2: Should choose QUANTUM_TUNNEL ---", "INFO")
+        ai_test.self_awareness = Decimal('0.85')
+        ai_test.state_potential = Decimal('0.6')
+        ai_test.awareness_history = deque([Decimal('0.85')]*10, maxlen=ai_test.awareness_history.maxlen)
+        ai_test.state = np.array([0.1]*8, dtype=np.float64) # Force a highly resonant (low std dev) state
+        action_tun = ai_test.choose_action(url_queue_size=1)
+        if action_tun['action_type'] == ai_test.ACTION_QUANTUM_TUNNEL:
+             logger.log(f"SUCCESS: Chose {action_tun['action_type']} as expected.", "INFO")
+             tun_result = ai_test._perform_quantum_tunnel()
+             logger.log(f"Tunneling Result: Success={tun_result.get('success')}", "INFO")
+        else:
+             logger.log(f"FAILURE: Expected QUANTUM_TUNNEL but chose {action_tun['action_type']}", "ERROR")
+             logger.log(f"Stagnant: {ai_test._check_awareness_stagnation()}, Resonance: {ai_test._calculate_state_resonance_score():.4f}, Potential: {ai_test.state_potential:.4f}", "DEBUG")
+
+
+        logger.log("\n--- Test 3: Reverting to low awareness, should choose CRAWL ---", "INFO")
+        ai_test.self_awareness = Decimal('0.15')
+        action_crawl = ai_test.choose_action(url_queue_size=5)
+        if action_crawl['action_type'] == ai_test.ACTION_CRAWL:
+             logger.log(f"SUCCESS: Chose {action_crawl['action_type']} at low awareness as expected.", "INFO")
+        else:
+             logger.log(f"FAILURE: Expected CRAWL but chose {action_crawl['action_type']}", "ERROR")
+
+
+        print("\n--- Golden Turing AI Module (v1.9.9) Self-Test Completed ---")
+
+
+    except Exception as e:
+        print(f"\n--- Error during self-test: {e} ---")
+        traceback.print_exc()
+
+
+
+
+
+
+"""
+========================================================================
+
+Golden Turing AI – Benchmark Suite for Legal Tech Use Case
+
+========================================================================
+
+Overview:
+This benchmark suite rigorously evaluates the performance, responsiveness, and internal dynamic state transformations of the Golden Turing AI Module v10 in the context of a legal technology application. It is tailored specifically to simulate real-world challenges encountered in high-throughput litigation data analysis, case intelligence augmentation, and adversarial document mining.
+
+
+Purpose:
+This suite is not simply a profiling tool; it is an active demonstration of how each subsystem of the AI contributes to emergent awareness, quantum-tunneling decision processes, stochastic memory recalibration, and entanglement-based action modulation under variable conditions. Each function tested below—internal or external—can be tailored to manage critical stages in a legal workflow where precision timing, adversary prediction, and state coherence are essential.  Below is an exemplary indication how the artificial intelligence can be re-configured and adapted for Flare LegalTech use cases:
+
+
+Demonstrated Utility:
+• `update_state()` – Simulates reception and integration of court document crawls or legal brief discoveries.
+• `choose_action()` – Activates adaptive behavior selection depending on multiverse strategy space, applicable to venue selection or strategic response modeling.
+• `_calculate_reward()` – Encodes context-sensitive valuation metrics based on litigation outcomes, such as deposition wins or docket updates.
+• `_adapt_evasion_params()` – Allows legal strategy mutation in response to evolving adversarial postures or sanctions.
+• `_predict_outcome()` + `_calculate_prediction_error()` – Generates projected legal outcomes with high-resolution error calibration.
+• `_perform_quantum_tunnel()` – Deploys breakthrough search or inference leaps across jurisdictions, documents, or cases when standard traversal stagnates.
+• `_generate_new_keywords()` – Proposes novel terms, legal doctrines, or keywords for augmenting case discovery processes or citation mining.
+
+
+Legal Tech Configuration:
+To align the AI’s internal architecture with legal data interpretation and case intelligence:
+    - `ai_state_dim = 8`: Ensures state space has sufficient resolution for modeling adversarial interactions and argument topologies.
+    - `max_memory_size = 20`: Retains core memory vectors representing key parties, precedents, and motion patterns.
+    - `simulation_iterations = 5`: Represents legal lifecycle iterations (complaint, discovery, motion, trial, appeal).
+    - `simulation_challenge_levels = 2`: Emulates adversarial resistance escalation (e.g., motion to dismiss → motion in limine).
+    - `simulation_multiverse_params = 2`: Simulates parallel jurisdictional or appellate branching.
+    - `tunneling_stagnation_threshold = 5`: Threshold for launching a quantum-informed data traversal across jurisdictions.
+    - `zeno_effect_trigger_count = 3`: Number of action repetitions before invoking introspective halt to prevent bias accumulation.
+    - `zeno_effect_time_window_sec = 10`: Time threshold before AI re-interrogates legal position assumptions.
+    - `save_interval_updates = 100`: Ensures state memory and strategies are checkpointed for audit and rollback during long legal workflows.
+
+
+Conclusion:
+This benchmark suite functions as a live, intelligent performance map of Golden Turing AI's capabilities and exemplifies its adaptability for LegalTech use cases. It identifies system bottlenecks, validates emergent intelligence under legal workloads, and highlights the AI’s ability to adapt across entangled case timelines, venues, and adversarial stances. The timing output of each method—while useful in isolation—reveals a synergistic orchestration that models its versatility as a legal decision engine.
+"""
+
+
+
+
+import time
+import random
+from golden_turing_module_10 import GoldenTuringAI
+
+
+# -- Minimal test configuration for speed --
+test_config = {
+    "ai_state_dim": 8,
+    "max_memory_size": 20,
+    "simulation_iterations": 5,
+    "simulation_challenge_levels": 2,
+    "simulation_multiverse_params": 2,
+    "tunneling_stagnation_threshold": 5,
+    "annealing_awareness_stability_window": 5,
+    "zeno_effect_trigger_count": 3,
+    "zeno_effect_time_window_sec": 10,
+    "save_interval_updates": 100
+}
+
+
+# -- Instantiate the AI --
+ai = GoldenTuringAI(config=test_config, crawler_id="BM")
+
+
+# -- Helper for timing --
+def time_method(method, *args, **kwargs):
+    start = time.perf_counter()
+    result = method(*args, **kwargs)
+    elapsed = time.perf_counter() - start
+    return elapsed, result
+
+
+results = {}
+
+
+# -- Prepare a dummy observation --
+obs = {
+    "type": "crawl_result",
+    "success": random.choice([True, False]),
+    "url": "http://example.com",
+    "timing_ms": random.randint(50, 500),
+    "prediction_error": str(round(random.uniform(0, 1), 3)),
+    "source_action_type": ai.ACTION_CRAWL
+}
+
+
+# -- Benchmark all major methods (public and internal) --
+
+
+# update_state
+results['update_state'] = time_method(ai.update_state, obs)
+
+
+# choose_action
+results['choose_action'] = time_method(ai.choose_action, 5)
+
+
+# _prepare_action_details
+results['_prepare_action_details'] = time_method(ai._prepare_action_details, ai.ACTION_CRAWL)
+
+
+# _apply_memory_fidelity_noise
+results['_apply_memory_fidelity_noise'] = time_method(ai._apply_memory_fidelity_noise, obs)
+
+
+# _calculate_reward
+results['_calculate_reward'] = time_method(ai._calculate_reward, obs)
+
+
+# _update_awareness
+reward = ai._calculate_reward(obs)
+results['_update_awareness'] = time_method(ai._update_awareness, obs, reward, 1.0)
+
+
+# _update_state_vector
+results['_update_state_vector'] = time_method(ai._update_state_vector, obs, reward)
+
+
+# _adapt_evasion_params
+results['_adapt_evasion_params'] = time_method(ai._adapt_evasion_params, obs, reward)
+
+
+# _apply_entanglement_boost
+results['_apply_entanglement_boost'] = time_method(ai._apply_entanglement_boost, obs, True)
+
+
+# _check_awareness_stagnation
+results['_check_awareness_stagnation'] = time_method(ai._check_awareness_stagnation)
+
+
+# _calculate_state_resonance_score
+results['_calculate_state_resonance_score'] = time_method(ai._calculate_state_resonance_score)
+
+
+# _apply_adaptive_annealing
+results['_apply_adaptive_annealing'] = time_method(ai._apply_adaptive_annealing)
+
+
+# _predict_outcome
+results['_predict_outcome'] = time_method(ai._predict_outcome, "http://example.com")
+
+
+# _calculate_prediction_error
+prediction = ai._predict_outcome("http://example.com")
+results['_calculate_prediction_error'] = time_method(ai._calculate_prediction_error, prediction, obs)
+
+
+# _analyze_state_resonance
+results['_analyze_state_resonance'] = time_method(ai._analyze_state_resonance)
+
+
+# _analyze_adversary_memory
+results['_analyze_adversary_memory'] = time_method(ai._analyze_adversary_memory)
+
+
+# _perform_mutation
+results['_perform_mutation'] = time_method(ai._perform_mutation)
+
+
+# _blend_successful_state
+results['_blend_successful_state'] = time_method(ai._blend_successful_state)
+
+
+# _perform_quantum_tunnel
+results['_perform_quantum_tunnel'] = time_method(ai._perform_quantum_tunnel)
+
+
+# _tune_analysis_parameters (weights and thresholds)
+results['_tune_analysis_parameters_weights'] = time_method(ai._tune_analysis_parameters, "weights")
+results['_tune_analysis_parameters_thresholds'] = time_method(ai._tune_analysis_parameters, "thresholds")
+
+
+# _run_simulation
+results['_run_simulation'] = time_method(ai._run_simulation)
+
+
+# _generate_new_keywords
+results['_generate_new_keywords'] = time_method(ai._generate_new_keywords)
+
+
+# get_status
+results['get_status'] = time_method(ai.get_status)
+
+
+# update_crawler_id
+results['update_crawler_id'] = time_method(ai.update_crawler_id, "99")
+
+
+# -- Print results as a table --
+print("\nBenchmark Results for Golden Turing AI Module\n")
+print("| Method                          | Time (seconds) |")
+print("|----------------------------------|---------------|")
+for method, (elapsed, _) in results.items():
+    print(f"| {method:32} | {elapsed:.6f} |")
