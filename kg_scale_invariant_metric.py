@@ -190,13 +190,57 @@ def check_lambda_covariance(params: GeometryParams, field: FieldParams) -> Dict[
     }
 
 
+def compute_bogoliubov_leakage(params_base: GeometryParams, params_fluct: GeometryParams, field: FieldParams, k: int = 40) -> Dict[str, float]:
+    # Build baseline modes
+    z0, r0, rho0, R0 = integrate_profile(params_base)
+    A0, _ = build_kg_operator(z0, r0, R0, field)
+    w20, V0 = compute_modes(A0, k=k)
+    V0 = np.column_stack([normalize_on_z(z0, V0[:, j]) for j in range(V0.shape[1])])
+
+    # Build fluctuating modes
+    zf, rf, rhof, Rf = integrate_profile(params_fluct)
+    Af, _ = build_kg_operator(zf, rf, Rf, field)
+    w2f, Vf = compute_modes(Af, k=k)
+    Vf = np.column_stack([normalize_on_z(zf, Vf[:, j]) for j in range(Vf.shape[1])])
+
+    # Interpolate fluctuating modes onto baseline grid for overlap
+    Vf_on_z0 = np.empty_like(V0)
+    for j in range(Vf.shape[1]):
+        Vf_on_z0[:, j] = np.interp(z0, zf, Vf[:, j], left=0.0, right=0.0)
+        # Re-normalize after interpolation
+        Vf_on_z0[:, j] = normalize_on_z(z0, Vf_on_z0[:, j])
+
+    # Overlap matrix S_{ij} = ∫ dz V0_i(z) Vf_j(z)
+    S = np.empty((V0.shape[1], Vf_on_z0.shape[1]))
+    for i in range(V0.shape[1]):
+        for j in range(Vf_on_z0.shape[1]):
+            S[i, j] = np.trapezoid(V0[:, i] * Vf_on_z0[:, j], z0)
+
+    abs2 = np.abs(S)**2
+    total = float(abs2.sum() + 1e-18)
+    diag = float(np.trace(abs2))
+    leakage = max(0.0, 1.0 - diag/total)
+    return {
+        'leakage_fraction': leakage,
+        'diag_weight': diag/total,
+        'k_used': int(min(V0.shape[1], Vf_on_z0.shape[1]))
+    }
+
+
 def run_phase3() -> None:
-    geo = GeometryParams()
+    # Baseline geometry (epsilon=0.0)
+    geo = GeometryParams(epsilon=0.0)
     field = FieldParams(mu=0.5, xi=0.0, m_theta=0, k_eig=40)
 
     z, r, rho, R = integrate_profile(geo)
     A, pot = build_kg_operator(z, r, R, field)
     w2, modes = compute_modes(A, k=field.k_eig)
+
+    # Curvature check: R ≈ -2 α^2
+    alpha = math.log(geo.lam)
+    R_expected = -2.0 * (alpha ** 2)
+    R_mean = float(np.mean(R))
+    R_std = float(np.std(R))
 
     # Save and plot diagnostics
     os.makedirs('outputs', exist_ok=True)
@@ -205,7 +249,7 @@ def run_phase3() -> None:
     fig, ax = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
     ax[0].plot(z, r)
     ax[0].set_ylabel('r(z)')
-    ax[0].set_title('Scale-invariant axisymmetric profile')
+    ax[0].set_title('Scale-invariant axisymmetric profile (epsilon=0)')
     ax[1].plot(z, rho)
     ax[1].set_ylabel('ρ(z)')
     ax[2].plot(z, R)
@@ -221,22 +265,43 @@ def run_phase3() -> None:
         ax.plot(z, normalize_on_z(z, modes[:, j]), label=f'j={j}, ω^2={w2[j]:.3f}')
     ax.set_xlabel('z')
     ax.set_ylabel('mode amplitude')
-    ax.set_title('Lowest normal modes (m_theta=0)')
+    ax.set_title('Lowest normal modes (m_theta=0, epsilon=0)')
     ax.legend()
     plt.tight_layout()
     plt.savefig('outputs/phase3_modes.png', dpi=150)
     plt.close(fig)
 
-    # Covariance under λ-rescaling
+    # Covariance under λ-rescaling (epsilon=0)
     cov_metrics = check_lambda_covariance(geo, field)
+
+    # Fluctuating geometry (epsilon=0.05)
+    geo_fluct = GeometryParams(lam=geo.lam, z_min=geo.z_min, z_max=geo.z_max, num_z=geo.num_z, r0=geo.r0, epsilon=0.05)
+    cov_metrics_fluct = check_lambda_covariance(geo_fluct, field)
+
+    # Bogoliubov-like leakage between epsilon=0 and epsilon=0.05 geometries
+    bog = compute_bogoliubov_leakage(geo, geo_fluct, field, k=field.k_eig)
 
     # Save results
     np.savez('outputs/phase3_results.npz', z=z, r=r, rho=rho, R=R, w2=w2, pot=pot, modes=modes)
     with open('outputs/phase3_covariance.txt', 'w') as f:
-        for k, v in cov_metrics.items():
-            f.write(f'{k}: {v}\n')
+        f.write(f'R_expected: {R_expected}\n')
+        f.write(f'R_mean: {R_mean}\n')
+        f.write(f'R_std: {R_std}\n')
+        f.write('--- lambda covariance (epsilon=0) ---\n')
+        for kname, v in cov_metrics.items():
+            f.write(f'{kname}: {v}\n')
+        f.write('--- lambda covariance (epsilon=0.05) ---\n')
+        for kname, v in cov_metrics_fluct.items():
+            f.write(f'{kname}: {v}\n')
+        f.write('--- bogoliubov-like leakage (epsilon 0 -> 0.05) ---\n')
+        for kname, v in bog.items():
+            f.write(f'{kname}: {v}\n')
 
-    print(f"Computed {len(w2)} modes. Lowest ω^2={w2[0]:.6f}. Covariance overlap≈{cov_metrics['mean_overlap']:.3f} (max {cov_metrics['max_overlap']:.3f}).")
+    print(
+        f"Computed {len(w2)} modes. R≈{R_mean:.6f} (target {R_expected:.6f}). "
+        f"λ-cov max overlap ε=0: {cov_metrics['max_overlap']:.3f}, ε=0.05: {cov_metrics_fluct['max_overlap']:.3f}. "
+        f"Leakage≈{bog['leakage_fraction']:.3f}."
+    )
 
 
 if __name__ == '__main__':
