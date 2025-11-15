@@ -68,12 +68,17 @@ from phase4_entanglement import (
     build_hamiltonian,
     single_particle_entropy_for_cut,
 )
+from rl_rewards import RewardPrimitives
 
 
 LAMBDA_DILATION = float(np.sqrt(6.0) / 2.0)
 PHI_CONSTANT = float((1.0 + math.sqrt(5.0)) / 2.0)
 DUAL_SCALING_ALPHA = float(np.log(LAMBDA_DILATION) / np.log(PHI_CONSTANT))
 DEFAULT_RANDOM_SEED = 1337
+ENTROPY_FLOOR = 0.02
+ENTROPY_CEILING = 12.0
+ENTROPY_SHAPE_STRENGTH = 0.8
+OCCUPANCY_PRIOR_WEIGHT = 0.35
 
 
 SKLEARN_AVAILABLE = importlib.util.find_spec("sklearn") is not None
@@ -81,6 +86,313 @@ TORCH_AVAILABLE = importlib.util.find_spec("torch") is not None
 PLOTLY_AVAILABLE = importlib.util.find_spec("plotly") is not None
 MATPLOTLIB_AVAILABLE = importlib.util.find_spec("matplotlib") is not None
 SHAP_AVAILABLE = importlib.util.find_spec("shap") is not None
+
+logger = logging.getLogger(__name__)
+
+
+def _deterministic_score(identifier: str) -> float:
+    digest = hashlib.sha256(identifier.encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big")
+    return value / float(2**64 - 1)
+
+
+class PretrainedModelHandle:
+    """Lightweight deterministic stand-in for pretrained model artifacts."""
+
+    def __init__(self, model_type: str, path: Path) -> None:
+        self.model_type = model_type
+        self.path = path
+        self.fingerprint = hashlib.sha1(str(path).encode("utf-8")).hexdigest()  # nosec B324
+
+    def score(self, identifier: str) -> float:
+        token = f"{self.model_type}:{self.fingerprint}:{identifier}"
+        return _deterministic_score(token)
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "modelType": self.model_type,
+            "path": str(self.path),
+            "fingerprint": self.fingerprint,
+        }
+
+
+def load_gnn(path: str) -> PretrainedModelHandle:
+    return PretrainedModelHandle("affinity-gnn", Path(path))
+
+
+def load_classifier(path: str) -> PretrainedModelHandle:
+    return PretrainedModelHandle("toxicity-clf", Path(path))
+
+
+def load_transformer(path: str) -> PretrainedModelHandle:
+    return PretrainedModelHandle("synthesis-transformer", Path(path))
+
+
+def load_pretrained_models(cfg: Optional[Dict[str, Any]]) -> Dict[str, PretrainedModelHandle]:
+    models: Dict[str, PretrainedModelHandle] = {}
+    if not cfg:
+        return models
+    if cfg.get("affinityModelPath"):
+        affinity_path = Path(str(cfg["affinityModelPath"]))
+        if affinity_path.exists():
+            models["affinity"] = load_gnn(str(affinity_path))
+        else:
+            logger.info("Affinity model path %s missing; skipping load", affinity_path)
+    if cfg.get("toxModelPath"):
+        tox_path = Path(str(cfg["toxModelPath"]))
+        if tox_path.exists():
+            models["toxicity"] = load_classifier(str(tox_path))
+        else:
+            logger.info("Toxicity model path %s missing; skipping load", tox_path)
+    if cfg.get("synthModelPath"):
+        synth_path = Path(str(cfg["synthModelPath"]))
+        if synth_path.exists():
+            models["synthesis"] = load_transformer(str(synth_path))
+        else:
+            logger.info("Synthesis model path %s missing; skipping load", synth_path)
+    return models
+
+
+def validate_ligand_entries(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filter ligand entries to those with valid identifiers and metrics."""
+
+    valid: List[Dict[str, Any]] = []
+    invalid: List[Dict[str, Any]] = []
+    metric_keys = ("lambdaAttractorScore", "dilationFactor", "referenceEnergyMean")
+    for entry in entries or []:
+        smiles = entry.get("smiles", "")
+        metrics = entry.get("metrics") or {}
+        missing_metrics = [key for key in metric_keys if key not in metrics]
+        if not smiles or missing_metrics:
+            invalid.append(
+                {
+                    "ligandId": entry.get("ligandId"),
+                    "missingMetrics": missing_metrics,
+                    "hasSmiles": bool(smiles),
+                }
+            )
+            continue
+        valid.append(entry)
+    if invalid:
+        logger.warning(
+            "Ligand validation rejected %d entries: %s",
+            len(invalid),
+            invalid,
+        )
+    return valid
+
+
+class LightweightGNN:
+    """Deterministic lightweight surrogate used by inverse design and pretraining."""
+
+    def __init__(self, hidden_dim: int = 16, random_state: int = 0) -> None:
+        self.hidden_dim = hidden_dim
+        self.rng = np.random.default_rng(random_state or 0)
+        self.weights = self.rng.normal(scale=0.1, size=self.hidden_dim)
+        self.bias = 0.0
+        self.version = 0
+
+    def _featurize(self, smiles: str, lambda_context: Optional[Dict[str, Any]] = None) -> np.ndarray:
+        tokens = [ord(char) for char in smiles or "stub"]
+        features = np.zeros(self.hidden_dim, dtype=float)
+        for idx, token in enumerate(tokens):
+            features[idx % self.hidden_dim] += (token % 23) / 23.0
+        if lambda_context:
+            entropy = float(lambda_context.get("entropyMean", 0.5))
+            curvature = float(lambda_context.get("curvatureMean", 0.1))
+            features += 0.05 * entropy
+            features -= 0.03 * curvature
+        return features
+
+    def score(self, smiles: str, lambda_context: Optional[Dict[str, Any]] = None) -> float:
+        features = self._featurize(smiles, lambda_context)
+        return float(np.tanh(float(np.dot(self.weights, features) + self.bias)))
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "weights": self.weights.tolist(),
+            "bias": float(self.bias),
+            "version": self.version,
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        if not state:
+            return
+        if "weights" in state:
+            self.weights = np.asarray(state["weights"], dtype=float)
+        if "bias" in state:
+            self.bias = float(state["bias"])
+        if "version" in state:
+            self.version = int(state["version"])
+
+    def train_step(
+        self,
+        dataset: Sequence[Tuple[str, float]],
+        lambda_context: Optional[Dict[str, Any]] = None,
+        learning_rate: float = 0.05,
+    ) -> None:
+        if not dataset:
+            return
+        for smiles, target in dataset:
+            target = float(np.clip(target, 0.0, 1.0))
+            features = self._featurize(smiles, lambda_context)
+            pred = float(np.dot(self.weights, features) + self.bias)
+            pred = float(np.tanh(pred))
+            grad = pred - target
+            self.weights -= learning_rate * grad * features
+            self.bias -= learning_rate * grad
+        self.version += 1
+
+
+class InverseDesignEngine:
+    """λ-aware inverse design harness with simple SMILES genetic operators."""
+
+    def __init__(
+        self,
+        context: QuantumContext,
+        surrogate_model: Optional[LightweightGNN] = None,
+        population_size: int = 24,
+        random_state: int = DEFAULT_RANDOM_SEED,
+    ) -> None:
+        self.context = context
+        self.population_size = max(population_size, 4)
+        self.surrogate_model = surrogate_model or LightweightGNN(random_state=random_state)
+        self.rng = np.random.default_rng(random_state)
+        self.lambda_stats = QuantumContext.shell_statistics(self.context.lambda_shells)
+
+    def _mutate(self, smiles: str) -> str:
+        fragments = ["C", "N", "O", "Cl", "F", "Br", "=O", "c1ccccc1"]
+        op = self.rng.choice(["add", "delete", "swap"])
+        if op == "add":
+            frag = self.rng.choice(fragments)
+            idx = self.rng.integers(0, max(1, len(smiles)))
+            return smiles[:idx] + frag + smiles[idx:]
+        if op == "delete" and len(smiles) > 2:
+            idx = self.rng.integers(0, len(smiles) - 1)
+            return smiles[:idx] + smiles[idx + 1 :]
+        if op == "swap" and len(smiles) > 1:
+            idx = self.rng.integers(0, len(smiles))
+            replacement = self.rng.choice(fragments)
+            return smiles[:idx] + replacement + smiles[idx + 1 :]
+        return smiles
+
+    def _crossover(self, parent_a: str, parent_b: str) -> str:
+        if not parent_a or not parent_b:
+            return parent_a or parent_b or "C"
+        cut_a = self.rng.integers(1, len(parent_a))
+        cut_b = self.rng.integers(1, len(parent_b))
+        return parent_a[:cut_a] + parent_b[cut_b:]
+
+    def _initial_population(self, seeds: Sequence[str]) -> List[str]:
+        population = [smiles for smiles in seeds if smiles]
+        scaffolds = ["c1ccccc1", "CCN(CC)CC", "CC(=O)O", "CCOC(=O)N"]
+        population.extend(scaffolds)
+        while len(population) < self.population_size:
+            base = self.rng.choice(population or scaffolds)
+            population.append(self._mutate(base))
+        return population[: self.population_size]
+
+    def run(
+        self,
+        seeds: Sequence[str],
+        generations: int = 12,
+        mutation_rate: float = 0.4,
+        exploration_temperature: float = 1.0,
+    ) -> List[str]:
+        population = self._initial_population(seeds)
+        mutation_rate = float(np.clip(mutation_rate, 0.05, 0.95))
+        temperature = float(np.clip(exploration_temperature, 0.1, 5.0))
+        for _ in range(max(1, generations)):
+            scored = self.score_population(population)
+            if not scored:
+                break
+            scores = np.array([entry[1] for entry in scored], dtype=float)
+            weights = np.exp(scores / temperature)
+            weight_sum = float(np.sum(weights)) or 1.0
+            weights /= weight_sum
+            parent_count = max(2, min(len(scored), self.population_size // 2))
+            parent_indices = self.rng.choice(len(scored), size=parent_count, replace=False, p=weights)
+            parents = [scored[idx][0] for idx in parent_indices]
+            offspring: List[str] = []
+            while len(offspring) < self.population_size:
+                if self.rng.random() < (1.0 - mutation_rate) and len(parents) >= 2:
+                    pa, pb = self.rng.choice(parents, size=2, replace=True)
+                    child = self._crossover(pa, pb)
+                else:
+                    parent = self.rng.choice(parents)
+                    child = self._mutate(parent)
+                offspring.append(child)
+            population = offspring
+        return population
+
+    def score(self, smiles: str) -> float:
+        lambda_context = {
+            "entropyMean": self.lambda_stats.get("entropyMean", 0.5),
+            "curvatureMean": self.lambda_stats.get("curvatureMean", 0.0),
+        }
+        base_score = self.surrogate_model.score(smiles, lambda_context=lambda_context)
+        curvature = lambda_context["curvatureMean"]
+        entropy = lambda_context["entropyMean"]
+        correction = 0.05 * entropy - 0.02 * curvature
+        return float(np.clip(base_score + correction, -1.0, 1.0))
+
+    def score_population(self, population: Sequence[str]) -> List[Tuple[str, float]]:
+        seen: Dict[str, float] = {}
+        for smiles in population:
+            if smiles not in seen:
+                seen[smiles] = self.score(smiles)
+        scored = sorted(seen.items(), key=lambda item: item[1], reverse=True)
+        return scored
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "populationSize": self.population_size,
+            "surrogateVersion": self.surrogate_model.version,
+        }
+
+
+class QuantumPretrainer:
+    """Utility to improve the surrogate GNN using quantum-agent labels."""
+
+    def __init__(
+        self,
+        surrogate_model: LightweightGNN,
+        context_provider: Callable[[], QuantumContext],
+        min_samples: int = 5,
+        learning_rate: float = 0.05,
+    ) -> None:
+        self.surrogate_model = surrogate_model
+        self.context_provider = context_provider
+        self.min_samples = min_samples
+        self.learning_rate = learning_rate
+
+    def load_dataset(self, per_ligand_reports: Sequence[Dict[str, Any]]) -> List[Tuple[str, float]]:
+        dataset: List[Tuple[str, float]] = []
+        for entry in per_ligand_reports:
+            smiles = entry.get("smiles")
+            energy = entry.get("bindingFreeEnergy")
+            if not smiles or energy is None:
+                continue
+            if not math.isfinite(energy):
+                continue
+            target = float(np.clip(np.tanh(-energy / 15.0), 0.0, 1.0))
+            dataset.append((smiles, target))
+        return dataset
+
+    def train(self, dataset: Sequence[Tuple[str, float]]) -> LightweightGNN:
+        if len(dataset) < self.min_samples:
+            return self.surrogate_model
+        context = self.context_provider()
+        lambda_stats = QuantumContext.shell_statistics(context.lambda_shells)
+        lambda_context = {
+            "entropyMean": lambda_stats.get("entropyMean", 0.5),
+            "curvatureMean": lambda_stats.get("curvatureMean", 0.1),
+        }
+        batch_size = max(4, min(16, len(dataset)))
+        for start in range(0, len(dataset), batch_size):
+            batch = dataset[start : start + batch_size]
+            self.surrogate_model.train_step(batch, lambda_context=lambda_context, learning_rate=self.learning_rate)
+        return self.surrogate_model
 
 if SKLEARN_AVAILABLE:
     sklearn_metrics_module = importlib.import_module("sklearn.metrics")
@@ -1684,7 +1996,7 @@ class PublicDataClient:
 class LambdaScalingToolkit:
     """Utility collection for ?-shell embeddings and diagnostics."""
 
-    DEFAULT_SHELL_COUNT = 5
+    DEFAULT_SHELL_COUNT = 10
 
     @staticmethod
     def _bhattacharyya(p: float, q: float) -> float:
@@ -1733,31 +2045,62 @@ class LambdaScalingToolkit:
         unique_shells = sorted(set(int(val) for val in shells_array.tolist()))
         if not unique_shells:
             unique_shells = list(range(cls.DEFAULT_SHELL_COUNT))
-        shell_count = min(len(unique_shells), cls.DEFAULT_SHELL_COUNT)
+        shell_count = max(1, min(len(unique_shells), cls.DEFAULT_SHELL_COUNT))
+        shell_indices = np.arange(shell_count, dtype=float)
+        shell_positions = shell_indices / max(float(shell_count - 1), 1.0)
+        radial_prior = np.exp(-shell_positions)
+        curvature_array = np.abs(np.asarray(curvature_list[:shell_count] or [1.0], dtype=float))
+        curvature_norm = np.max(curvature_array) or 1.0
+        curvature_prior = 1.0 + (curvature_array / curvature_norm)
+        shaped_prior_raw = radial_prior * curvature_prior
+        denom = max(float(np.sum(shaped_prior_raw)), 1e-6)
+        shaped_prior = shaped_prior_raw / denom
         base_radius = float(np.max(np.abs(radii_array)) or 1.0)
         descriptors: List[LambdaShellDescriptor] = []
         total_points = max(int(len(radii_array)), 1)
-        expected = 1.0 / float(shell_count)
+        entropy_base = max(float(entanglement_entropy), ENTROPY_FLOOR)
         for idx in range(shell_count):
             shell_id = unique_shells[idx]
             mask = shells_array == shell_id
-            occupancy = float(np.count_nonzero(mask) / total_points)
+            raw_occupancy = float(np.count_nonzero(mask) / total_points)
+            occupancy = float(
+                np.clip(
+                    (1.0 - OCCUPANCY_PRIOR_WEIGHT) * raw_occupancy
+                    + OCCUPANCY_PRIOR_WEIGHT * shaped_prior[idx],
+                    0.0,
+                    1.0,
+                )
+            )
             radius = base_radius / math.pow(LAMBDA_DILATION, idx)
-            curvature = curvature_list[idx % len(curvature_list)]
+            curvature = float(curvature_list[idx % len(curvature_list)])
+            entropy_deviation = occupancy - shaped_prior[idx]
+            entropy_shape = max(0.25, 1.0 + ENTROPY_SHAPE_STRENGTH * entropy_deviation)
             entropy = float(
                 np.clip(
-                    entanglement_entropy * (1.0 + 0.05 * idx),
-                    0.001,
-                    10.0,
+                    entropy_base * entropy_shape * (1.0 + 0.03 * idx),
+                    ENTROPY_FLOOR,
+                    ENTROPY_CEILING,
                 )
             )
             energy_mode = mode_list[idx % len(mode_list)]
             energy_density = float(energy_mode / max(radius, 1e-3))
             descriptors.append(
-                cls._as_descriptor(idx, radius, curvature, entropy, energy_density, occupancy, expected)
+                cls._as_descriptor(
+                    idx,
+                    radius,
+                    curvature,
+                    entropy,
+                    energy_density,
+                    occupancy,
+                    float(shaped_prior[idx]),
+                )
             )
-        attractor_score = float(np.mean([d.lambdaBhattacharyya for d in descriptors]))
-        entropy_gradient = float(descriptors[-1].lambdaEntropy - descriptors[0].lambdaEntropy) if descriptors else 0.0
+        attractor_score = float(np.mean([d.lambdaBhattacharyya for d in descriptors])) if descriptors else 0.0
+        entropy_gradient = (
+            float(descriptors[-1].lambdaEntropy - descriptors[0].lambdaEntropy)
+            if len(descriptors) > 1
+            else 0.0
+        )
         bhattacharyya_flux = float(np.std([d.lambdaBhattacharyya for d in descriptors])) if descriptors else 0.0
         basis = {
             "dilationFactor": LAMBDA_DILATION,
@@ -2126,6 +2469,7 @@ class PhysicalValidator:
 
     def validate(self, agent: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {"agent": agent, "adjustments": []}
+        adjustment_deltas: List[float] = []
 
         root_holder: Dict[str, Any] = {"root": copy.deepcopy(payload)}
 
@@ -2146,7 +2490,8 @@ class PhysicalValidator:
                     obj[idx] = _process(item, path + (f"[{idx}]",))
                 return obj
             if isinstance(obj, (int, float)):
-                corrected, adjusted = self._coerce_value(path[-1] if path else "", float(obj))
+                original_value = float(obj)
+                corrected, adjusted = self._coerce_value(path[-1] if path else "", original_value)
                 sigma = self._estimate_sigma(path[-1] if path else "", corrected)
                 lower, upper = self._credible_interval(corrected, sigma)
                 container: Any = root_holder["root"]
@@ -2158,7 +2503,11 @@ class PhysicalValidator:
                         "credibleInterval": [lower, upper],
                     }
                 if adjusted:
-                    metadata["adjustments"].append({"path": ".".join(path), "reason": "Constraint enforcement"})
+                    delta = abs(corrected - original_value)
+                    adjustment_deltas.append(delta)
+                    metadata["adjustments"].append(
+                        {"path": ".".join(path), "reason": "Constraint enforcement", "delta": delta}
+                    )
                 return corrected
             return obj
 
@@ -2171,6 +2520,11 @@ class PhysicalValidator:
         })
         if metadata["adjustments"]:
             validated_payload["validation"]["adjustments"] = metadata["adjustments"]
+        validator_diag = {
+            "adjustmentCount": len(metadata["adjustments"]),
+            "meanClampDistance": float(np.mean(adjustment_deltas)) if adjustment_deltas else 0.0,
+        }
+        validated_payload.setdefault("validatorDiagnostics", {}).update(validator_diag)
         return validated_payload
 
 
@@ -2671,6 +3025,8 @@ class GoldenTuringDDSAdapter:
 
 
 class AgentBase:
+    ACTION_SPACE: Dict[str, Tuple[float, float]] = {}
+
     def __init__(
         self,
         name: str,
@@ -2693,11 +3049,38 @@ class AgentBase:
         self.feature_extractor = feature_extractor
         self.active_learning = active_learning
         self.ml_api = ml_api
-        self.kwargs = kwargs
+        extra_kwargs = dict(kwargs)
+        self.config = extra_kwargs.pop("config", {}) or {}
+        self.ml_models = load_pretrained_models(self.config)
+        self._ml_warning_flags: Set[str] = set()
+        self.kwargs = extra_kwargs
         self.observation_state: Dict[str, Any] = {}
+        self.last_action_vector: Dict[str, float] = {}
+        self.reward_history: List[float] = []
+        self.quality_history: deque = deque(maxlen=32)
+        self.max_quality: float = float("-inf")
+        self.last_entropy_signal: float = 0.0
+        self.last_energy_signal: float = 0.0
 
     async def run(self) -> Dict[str, Any]:
         raise NotImplementedError
+
+    def _log_ml_fallback(self, model_key: str) -> None:
+        if model_key in self._ml_warning_flags:
+            return
+        self._ml_warning_flags.add(model_key)
+        logger.warning("%s: %s model not loaded, using heuristic fallback", self.name, model_key)
+
+    def _score_pretrained_model(self, model_key: str, identifier: str) -> Optional[float]:
+        model = self.ml_models.get(model_key)
+        if model is None:
+            self._log_ml_fallback(model_key)
+            return None
+        return model.score(identifier)
+
+    def _heuristic_model_score(self, model_key: str, identifier: str) -> float:
+        token = f"heuristic::{self.name}::{model_key}::{identifier}"
+        return _deterministic_score(token)
 
     def encode_lambda_latent(self, state: Dict[str, Any]) -> np.ndarray:
         """Convert lambda-shell descriptors into a tensorial latent."""
@@ -2732,8 +3115,72 @@ class AgentBase:
         self.observation_state["lambdaLatentVector"] = tensor.flatten()
         return tensor
 
+    def _prepare_action_vector(
+        self, action_vector: Optional[Dict[str, float]] = None
+    ) -> Dict[str, float]:
+        prepared: Dict[str, float] = {}
+        if not self.ACTION_SPACE:
+            if action_vector:
+                prepared = {key: float(value) for key, value in action_vector.items()}
+            self.observation_state["actionVector"] = prepared
+            self.last_action_vector = prepared
+            return prepared
+        for key, bounds in self.ACTION_SPACE.items():
+            low, high = bounds
+            midpoint = (low + high) / 2.0
+            value = midpoint
+            if action_vector and key in action_vector:
+                value = action_vector[key]
+            value = float(np.clip(value, low, high))
+            prepared[key] = value
+        self.observation_state["actionVector"] = prepared
+        self.last_action_vector = prepared
+        return prepared
+
+    def _reward_baseline(self) -> Dict[str, Any]:
+        prev_quality = self.quality_history[-1] if self.quality_history else 0.0
+        if self.max_quality == float("-inf"):
+            self.max_quality = prev_quality
+        quality_window = list(self.quality_history)
+        prev_entropy = self.last_entropy_signal
+        prev_energy = self.last_energy_signal
+        return {
+            "prev_quality": prev_quality,
+            "max_quality": self.max_quality,
+            "quality_window": quality_window,
+            "prev_entropy": prev_entropy,
+            "prev_energy": prev_energy,
+        }
+
+    def _record_quality(self, quality: float, entropy_signal: float, energy_signal: float) -> None:
+        self.quality_history.append(quality)
+        self.max_quality = max(self.max_quality, quality)
+        self.last_entropy_signal = entropy_signal
+        self.last_energy_signal = energy_signal
+
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        """Default reward for agents that have not defined a policy."""
+
+        baseline = self._reward_baseline()
+        validator = primitives.get("validatorDiagnostics", {})
+        reward = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.05,
+            lambda_clamp=0.01,
+        )
+        entropy_signal = float(primitives.get("entropy_mean", 0.0))
+        energy_signal = float(primitives.get("energy_signal", 0.0))
+        self._record_quality(reward, entropy_signal, energy_signal)
+        self.reward_history.append(reward)
+        return reward
+
 
 class StructuralAnalysisAgent(AgentBase):
+    ACTION_SPACE = {
+        "lambda_smoothing": (0.5, 2.0),
+        "curvature_regularization": (0.25, 2.5),
+    }
     def __init__(
         self,
         blackboard: QuantumBlackboard,
@@ -2761,64 +3208,122 @@ class StructuralAnalysisAgent(AgentBase):
         self.data_client = data_client
         self.pdb_id = pdb_id
 
-    def embed_lambda_shells(self, molecule_structure: np.ndarray) -> Dict[str, Any]:
+    def embed_lambda_shells(
+        self,
+        molecule_structure: np.ndarray,
+        action_params: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
         if molecule_structure.size == 0:
             return {"descriptors": [], "tensor": np.zeros((1, 7)), "shellFeatures": {}}
+        actions = action_params or {}
+        smoothing = float(actions.get("lambda_smoothing", 1.0))
+        curvature_reg = float(actions.get("curvature_regularization", 1.0))
         center = np.mean(molecule_structure, axis=0)
         distances = np.linalg.norm(molecule_structure - center, axis=1)
-        shell_indices = (distances / max(LAMBDA_DILATION, 1e-6)).astype(int)
         max_distance = float(np.max(distances) or 1.0)
-        shell_features: Dict[str, Dict[str, float]] = {}
+        shell_count = int(self.context.lambda_basis.get("shellCount") or LambdaScalingToolkit.DEFAULT_SHELL_COUNT)
+        shell_count = max(1, min(shell_count, LambdaScalingToolkit.DEFAULT_SHELL_COUNT))
+        scaled_distance = distances / max(max_distance / LAMBDA_DILATION, 1e-6)
+        shell_indices = np.clip(np.floor(scaled_distance * smoothing), 0, shell_count - 1).astype(int)
+        curvature_profile = self.context.curvature_profile or [0.0]
+        lambda_modes = self.context.lambda_modes or [1.0]
+        ent_base = max(float(self.context.entanglement_entropy), ENTROPY_FLOOR)
+        shell_features: Dict[int, Dict[str, float]] = {
+            idx: {
+                "count": 0.0,
+                "shell_curvature": 0.0,
+                "entanglement_density": 0.0,
+                "local_energy": 0.0,
+            }
+            for idx in range(shell_count)
+        }
+        total_atoms = max(1, len(distances))
         for atom_idx, shell in enumerate(shell_indices.tolist()):
             distance = float(distances[atom_idx])
             curvature = float(
-                self.context.curvature_profile[shell % len(self.context.curvature_profile)]
-                if self.context.curvature_profile
-                else 0.0
+                curvature_profile[shell % len(curvature_profile)] / max(curvature_reg, 0.25)
             )
             entropy = float(
-                self.context.entanglement_entropy
+                ent_base
                 * (1.0 + 0.05 * shell)
-                * np.exp(-distance / max_distance)
+                * np.exp(-distance / max(max_distance, 1e-3))
             )
-            energy_mode = (
-                self.context.lambda_modes[shell % len(self.context.lambda_modes)]
-                if self.context.lambda_modes
-                else 1.0
-            )
-            energy = float(energy_mode / max(distance, 1e-3))
-            key = str(shell)
-            bucket = shell_features.setdefault(
-                key,
-                {"count": 0.0, "shell_curvature": 0.0, "entanglement_density": 0.0, "local_energy": 0.0},
-            )
+            energy_mode = float(lambda_modes[shell % len(lambda_modes)])
+            energy = float(energy_mode / max(distance + 1e-3, 1e-3))
+            bucket = shell_features[shell]
             bucket["count"] += 1.0
             bucket["shell_curvature"] += curvature
             bucket["entanglement_density"] += entropy
             bucket["local_energy"] += energy
+        shell_positions = np.linspace(0.0, 1.0, shell_count, endpoint=False)
+        radial_prior = np.exp(-shell_positions * smoothing)
+        curvature_means = np.array(
+            [abs(shell_features[idx]["shell_curvature"]) + 1e-6 for idx in range(shell_count)],
+            dtype=float,
+        )
+        curvature_norm = float(np.max(curvature_means)) or 1.0
+        curvature_prior = 1.0 + (curvature_means / curvature_norm) * max(curvature_reg, 0.1)
+        shaped_prior_raw = radial_prior * curvature_prior
+        shaped_prior = shaped_prior_raw / max(float(np.sum(shaped_prior_raw)), 1e-6)
         descriptors: List[Dict[str, Any]] = []
-        for shell_key, stats in sorted(shell_features.items(), key=lambda item: int(item[0])):
-            shell = int(shell_key)
-            count = max(stats.pop("count", 1.0), 1.0)
+        for shell_idx in range(shell_count):
+            stats = shell_features[shell_idx]
+            count = max(stats["count"], 1.0)
             stats["shell_curvature"] /= count
             stats["entanglement_density"] /= count
             stats["local_energy"] /= count
-            descriptors.append(
-                {
-                    "shellIndex": shell,
-                    "lambdaRadius": max_distance / math.pow(LAMBDA_DILATION, shell),
-                    "lambdaCurvature": stats["shell_curvature"],
-                    "lambdaEntropy": stats["entanglement_density"],
-                    "lambdaEnergyDensity": stats["local_energy"],
-                    "lambdaBhattacharyya": float(np.clip(stats["entanglement_density"] / (self.context.entanglement_entropy + 1e-6), 0.0, 2.0)),
-                    "lambdaOccupancy": float(np.clip(count / len(distances), 0.0, 1.0)),
-                    "lambdaLeakage": float(np.clip(abs(count / len(distances) - 1.0 / (shell + 1)), 0.0, 1.0)),
-                }
+            raw_occ = count / total_atoms
+            occupancy = float(
+                np.clip(
+                    (1.0 - OCCUPANCY_PRIOR_WEIGHT) * raw_occ
+                    + OCCUPANCY_PRIOR_WEIGHT * shaped_prior[shell_idx],
+                    0.0,
+                    1.0,
+                )
             )
+            leakage = float(np.clip(abs(occupancy - shaped_prior[shell_idx]), 0.0, 1.0))
+            bhattacharyya = LambdaScalingToolkit._bhattacharyya(occupancy, shaped_prior[shell_idx])
+            descriptor = {
+                "shellIndex": shell_idx,
+                "lambdaRadius": max_distance / math.pow(LAMBDA_DILATION, shell_idx),
+                "lambdaCurvature": stats["shell_curvature"],
+                "lambdaEntropy": stats["entanglement_density"],
+                "lambdaEnergyDensity": stats["local_energy"],
+                "lambdaBhattacharyya": bhattacharyya,
+                "lambdaOccupancy": occupancy,
+                "lambdaLeakage": leakage,
+            }
+            descriptors.append(descriptor)
         tensor = self.encode_lambda_latent({"descriptors": descriptors})
-        embedding = {"descriptors": descriptors, "tensor": tensor, "shellFeatures": shell_features}
+        serialized_shell_features = {
+            str(idx): {
+                "count": shell_features[idx]["count"],
+                "shell_curvature": shell_features[idx]["shell_curvature"],
+                "entanglement_density": shell_features[idx]["entanglement_density"],
+                "local_energy": shell_features[idx]["local_energy"],
+            }
+            for idx in range(shell_count)
+        }
+        embedding = {"descriptors": descriptors, "tensor": tensor, "shellFeatures": serialized_shell_features}
         self.observation_state["lambdaShellEmbedding"] = tensor
         self.observation_state["lambdaShellFeatures"] = descriptors
+        per_shell_obs = [
+            {
+                "shellIndex": entry["shellIndex"],
+                "lambdaEntropy": entry["lambdaEntropy"],
+                "lambdaOccupancy": entry["lambdaOccupancy"],
+                "lambdaLeakage": entry["lambdaLeakage"],
+            }
+            for entry in descriptors
+        ]
+        global_obs = {
+            "lambdaAttractorScore": float(np.mean([entry["lambdaBhattacharyya"] for entry in descriptors]) if descriptors else 0.0),
+            "lambdaEntropyGradient": float(
+                (descriptors[-1]["lambdaEntropy"] - descriptors[0]["lambdaEntropy"]) if len(descriptors) > 1 else 0.0
+            ),
+            "lambdaBhattacharyyaFlux": float(np.std([entry["lambdaBhattacharyya"] for entry in descriptors]) if descriptors else 0.0),
+        }
+        self.observation_state["lambdaObservables"] = {"perShell": per_shell_obs, "global": global_obs}
         return embedding
 
     def _parse_atoms(self, pdb_text: str) -> np.ndarray:
@@ -2885,10 +3390,11 @@ class StructuralAnalysisAgent(AgentBase):
             entries.append(entry)
         return entries
 
-    async def run(self) -> Dict[str, Any]:
+    async def run(self, action_vector: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        actions = self._prepare_action_vector(action_vector)
         pdb_text = self.data_client.fetch_pdb(self.pdb_id)
         coords = self._parse_atoms(pdb_text)
-        lambda_embedding = self.embed_lambda_shells(coords)
+        lambda_embedding = self.embed_lambda_shells(coords, actions)
         pockets = self._detect_pockets(coords, lambda_embedding)
         waters = self._classify_waters(coords)
         lambda_analysis = LambdaScalingToolkit.analyze_coordinates(coords, self.context)
@@ -2985,8 +3491,59 @@ class StructuralAnalysisAgent(AgentBase):
         await self.blackboard.post("binding", validated)
         return validated
 
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        baseline = self._reward_baseline()
+        entropy = primitives.get("entropy_per_shell") or [self.context.entanglement_entropy]
+        leakage = primitives.get("leakage") or [0.0]
+        curvature_gradient = float(primitives.get("curvature_gradient", 0.0))
+        entropy_mean = float(primitives.get("entropy_mean", np.mean(entropy)))
+        energy_signal = float(primitives.get("energy_signal", self.context.enhancement_factor))
+        occ_curr = primitives.get("occupancy")
+        if occ_curr is None:
+            occ_curr = []
+        occ_prev = primitives.get("occupancy_prev")
+        if occ_prev is None:
+            occ_prev = []
+        shell_delta = float(primitives.get("shellEntropyDelta", 0.0))
+        compress = RewardPrimitives.R_compress(
+            bool(primitives.get("is_compressed", False)),
+            float(primitives.get("compression_ratio", 0.0)),
+            bool(primitives.get("basis_mismatch", False)),
+            k_c=0.3,
+            k_b=0.2,
+        )
+        lambda_term = RewardPrimitives.R_lambda(entropy, curvature_gradient, leakage)
+        flow_term = RewardPrimitives.R_lambda_flow(occ_curr, occ_prev, shell_delta)
+        Q_struct = 0.7 * lambda_term + 0.2 * flow_term + 0.1 * compress
+        R_dd = RewardPrimitives.R_dd(Q_struct, baseline["max_quality"], lambda_dd=0.1)
+        R_stag = RewardPrimitives.R_stagnation(
+            Q_struct,
+            baseline["prev_quality"],
+            entropy_mean,
+            baseline["prev_entropy"],
+            energy_signal,
+            baseline["prev_energy"],
+            lambda_stag=0.2,
+        )
+        validator = primitives.get("validatorDiagnostics", {})
+        R_val = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.05,
+            lambda_clamp=0.02,
+        )
+        total = float(Q_struct + R_dd + R_stag + R_val)
+        self._record_quality(Q_struct, entropy_mean, energy_signal)
+        self.reward_history.append(total)
+        return total
+
 
 class LigandDiscoveryAgent(AgentBase):
+    ACTION_SPACE = {
+        "exploration_temperature": (0.1, 5.0),
+        "mutation_rate": (0.05, 0.95),
+        "novelty_bias": (0.0, 1.0),
+    }
     def __init__(
         self,
         blackboard: QuantumBlackboard,
@@ -3001,6 +3558,7 @@ class LigandDiscoveryAgent(AgentBase):
         feature_extractor: Optional[FeatureExtractor] = None,
         active_learning: Optional[ActiveLearningCoordinator] = None,
         ml_api: Optional[MLInferenceAPI] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             "LigandDiscoveryAgent",
@@ -3012,11 +3570,41 @@ class LigandDiscoveryAgent(AgentBase):
             feature_extractor=feature_extractor,
             active_learning=active_learning,
             ml_api=ml_api,
+            config=config,
         )
         self.data_client = data_client
         self.llm = llm
         self.target_query = target_query
         self.quantum_reference = quantum_reference
+        surrogate_seed = int(hashlib.sha1(target_query.encode("utf-8")).hexdigest(), 16) % 997  # nosec B303
+        self.surrogate_model = LightweightGNN(random_state=surrogate_seed)
+        self.inverse_engine: Optional[InverseDesignEngine] = None
+        self._engine_context_id: Optional[str] = None
+
+    def _derive_seed_smiles(self, seed_ligands: Optional[Sequence[Dict[str, Any]]]) -> List[str]:
+        if seed_ligands:
+            smiles = [entry.get("smiles") or entry.get("ligandId", "") for entry in seed_ligands]
+            return [item for item in smiles if item]
+        scaffold_library = [
+            "c1ccccc1",
+            "CC(=O)O",
+            "CCN(CC)CC",
+            "COC(=O)N",
+        ]
+        return scaffold_library
+
+    def _estimate_novelty(self, smiles: str, seed_smiles: Sequence[str]) -> float:
+        if not seed_smiles:
+            return 0.8
+        base_set = set(smiles)
+        penalties = []
+        for seed in seed_smiles:
+            seed_set = set(seed)
+            overlap = len(base_set & seed_set)
+            union = max(len(base_set | seed_set), 1)
+            penalties.append(overlap / union)
+        similarity = float(np.mean(penalties)) if penalties else 0.0
+        return float(np.clip(1.0 - similarity, 0.0, 1.0))
 
     def compute_shell_entropy_curvature_map(self, ligand: Dict[str, Any]) -> Dict[str, Any]:
         diagnostics = ligand.get("lambdaShellDiagnostics") or {}
@@ -3051,100 +3639,187 @@ class LigandDiscoveryAgent(AgentBase):
         self.observation_state.setdefault("ligandShellMaps", []).append(map_payload)
         return map_payload
 
-    def _inverse_design(self, pocket_id: str) -> Dict[str, Any]:
-        candidates = self.data_client.fetch_pubchem_candidates(self.target_query)
-        top = candidates[0]
-        return {
-            "setId": f"lig-set-{pocket_id}-inverse",
-            "sourcePocketId": pocket_id,
-            "strategy": "inverse_design",
-            "candidates": [
-                {
-                    "ligandId": top["ligandId"],
-                    "smiles": top["smiles"],
-                    "drugLikeness": float(np.clip(0.7 + 0.1 * random.random(), 0.0, 1.0)),
-                    "syntheticAccessibility": float(np.clip(2.0 + random.random(), 1.0, 10.0)),
-                }
-            ],
+    def _compute_candidate_metrics(self, candidate: Dict[str, Any]) -> Dict[str, Any]:
+        diagnostics = candidate.get("lambdaShellDiagnostics", {})
+        descriptors = diagnostics.get("descriptors", []) or self.context.lambda_shells
+        stats = QuantumContext.shell_statistics(descriptors)
+        lambda_context = {
+            "entropyMean": stats.get("entropyMean", 0.5),
+            "curvatureMean": stats.get("curvatureMean", 0.0),
         }
-
-    def _scaffold_hopping(self, pocket_id: str) -> Dict[str, Any]:
-        prompt = textwrap.dedent(
-            f"""
-            Target pocket {pocket_id} exhibits hydrophobic residues and entanglement entropy {self.context.entanglement_entropy:.3f}.
-            Suggest a novel aromatic scaffold with heteroatom donors suitable for COX-2 inhibition.
-            """
-        ).strip()
-        suggestion = self.llm.complete(prompt)
-        novelty = float(np.clip(0.85 + 0.05 * random.random(), 0.0, 1.0))
-        return {
-            "setId": f"lig-set-{pocket_id}-scaffold",
-            "sourcePocketId": pocket_id,
-            "strategy": "scaffold_hopping",
-            "candidates": [
-                {
-                    "ligandId": "lig-novel-001",
-                    "smiles": "c1ccc(NC(=O)NC2=NC=CC=C2)cc1",
-                    "noveltyScore": novelty,
-                    "predictedInteractions": ["H-bond:TYR:88", "p-p:TRP:120"],
-                    "designRationale": suggestion,
-                }
-            ],
+        surrogate = self.inverse_engine.surrogate_model if self.inverse_engine else self.surrogate_model
+        surrogate_affinity = surrogate.score(candidate.get("smiles", ""), lambda_context=lambda_context) if surrogate else 0.0
+        surrogate_norm = 0.5 * (surrogate_affinity + 1.0)
+        novelty = float(candidate.get("noveltyScore", 0.5))
+        shell_alignment = float(stats.get("bhattacharyyaMean", 0.5))
+        attractor = float(
+            np.clip(
+                0.2
+                + 0.4 * shell_alignment
+                + 0.2 * novelty
+                + 0.2 * surrogate_norm,
+                0.0,
+                1.0,
+            )
+        )
+        curvature_mean = float(stats.get("curvatureMean", 0.0))
+        dilation = float(
+            np.clip(
+                0.95 + 0.02 * curvature_mean + 0.05 * (novelty - 0.5),
+                0.85,
+                1.15,
+            )
+        )
+        reference_base = float(self.quantum_reference.get("statistics", {}).get("meanEnergy", -7.0))
+        reference_energy = float(reference_base - 0.5 * surrogate_norm - 0.25 * novelty)
+        metrics = {
+            "lambdaAttractorScore": attractor,
+            "dilationFactor": dilation,
+            "referenceEnergyMean": reference_energy,
+            "lambdaShellStats": stats,
         }
+        return metrics
 
-    async def run(self) -> Dict[str, Any]:
+    def _passes_acceptance_thresholds(self, metrics: Dict[str, Any]) -> bool:
+        return (
+            metrics.get("lambdaAttractorScore", 0.0) > 0.25
+            and 0.9 <= float(metrics.get("dilationFactor", 0.0)) <= 1.1
+            and float(metrics.get("referenceEnergyMean", 0.0)) < -6.5
+        )
+
+    async def run(
+        self,
+        context_override: Optional[QuantumContext] = None,
+        seed_ligands: Optional[Sequence[Dict[str, Any]]] = None,
+        beam_width: int = 12,
+        action_vector: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        actions = self._prepare_action_vector(action_vector)
+        context_in_use = context_override or self.context
+        population_size = max(int(beam_width * 1.5), beam_width + 2)
+        context_identifier = f"{id(context_in_use)}:{context_in_use.entanglement_entropy:.3f}"
+        if (
+            self.inverse_engine is None
+            or self.inverse_engine.population_size != population_size
+            or context_identifier != self._engine_context_id
+        ):
+            self.inverse_engine = InverseDesignEngine(
+                context_in_use,
+                surrogate_model=self.surrogate_model,
+                population_size=population_size,
+                random_state=int(population_size + DEFAULT_RANDOM_SEED),
+            )
+            self._engine_context_id = context_identifier
         binding_report = await self.blackboard.read("binding")
         pocket_id = binding_report["pockets"][0]["pocketId"] if binding_report else "pocket-01"
-        inverse_set = self._inverse_design(pocket_id)
-        scaffold_set = self._scaffold_hopping(pocket_id)
-        synthetic_library = []
-        ref_samples = self.quantum_reference.get("samples", [])
-        for idx, sample in enumerate(ref_samples[:3]):
-            synthetic_library.append(
-                {
-                    "libraryLigandId": f"quant-lib-{idx}",
-                    "bindingEnergyRef": sample["bindingEnergy"],
-                    "entanglementEntropyRef": sample["entanglementEntropy"],
-                }
-            )
-        motif_alerts = []
-        for candidate in scaffold_set["candidates"]:
-            if "NN" in candidate["smiles"] or candidate["smiles"].count("N") > 3:
-                motif_alerts.append(
-                    {
-                        "ligandId": candidate["ligandId"],
-                        "issue": "Potential unphysical multi-azide motif detected",
-                        "recommendedCorrection": "Reduce adjacent nitrogen donors to maintain stability",
-                    }
-                )
-        combined = {
-            "inverse": inverse_set,
-            "scaffold": scaffold_set,
-            "syntheticLibrary": synthetic_library,
-            "motifAlerts": motif_alerts,
-            "lambdaShellBasis": self.context.lambda_basis,
-        }
-        ligand_lambda_diag = None
-        for bundle in (inverse_set["candidates"], scaffold_set["candidates"]):
-            for candidate in bundle:
-                lambda_diag = LambdaScalingToolkit.analyze_ligand(
-                    candidate.get("smiles", ""), self.context, self.quantum_reference
-                )
-                candidate["lambdaShellDiagnostics"] = lambda_diag
-                candidate["lambdaShellFingerprint"] = lambda_diag.get("summary", {}).get(
+        seed_smiles = self._derive_seed_smiles(seed_ligands)
+        mutation_rate = float(actions.get("mutation_rate", 0.4))
+        exploration_temp = float(actions.get("exploration_temperature", 1.0))
+        population = self.inverse_engine.run(
+            seed_smiles,
+            generations=12,
+            mutation_rate=mutation_rate,
+            exploration_temperature=exploration_temp,
+        )
+        scored_population = self.inverse_engine.score_population(population)
+        top_candidates = scored_population[: max(1, beam_width)]
+        lambda_context_snapshot = QuantumContext.shell_statistics(context_in_use.lambda_shells)
+        generated_ligands: List[Dict[str, Any]] = []
+        novelty_bias = float(actions.get("novelty_bias", 0.5))
+        for smiles, score in top_candidates:
+            lambda_diag = LambdaScalingToolkit.analyze_ligand(smiles, context_in_use, self.quantum_reference)
+            novelty = self._estimate_novelty(smiles, seed_smiles)
+            novelty = float(np.clip(novelty + 0.5 * (novelty_bias - 0.5), 0.0, 1.0))
+            synthetic_steps = max(2, int(round(2 + novelty * 3)))
+            ligand_id = f"lig-{hashlib.sha1(smiles.encode('utf-8')).hexdigest()[:10]}"  # nosec B324
+            candidate = {
+                "ligandId": ligand_id,
+                "smiles": smiles,
+                "inverseDesignScore": float(score),
+                "noveltyScore": float(novelty),
+                "syntheticSteps": synthetic_steps,
+                "designRationale": "InverseDesignEngine genetics",
+                "lambdaShellDiagnostics": lambda_diag,
+                "lambdaShellFingerprint": lambda_diag.get("summary", {}).get(
                     "lambdaShellFingerprint", lambda_diag.get("fingerprint", [])
-                )
-                base_rationale = candidate.get("designRationale", "").strip()
-                candidate["designRationale"] = (
-                    f"{base_rationale} | ?-shell alignment maintained"
-                    if base_rationale
-                    else "?-shell alignment maintained"
-                )
-                self.compute_shell_entropy_curvature_map(candidate)
-                if ligand_lambda_diag is None:
-                    ligand_lambda_diag = lambda_diag
+                ),
+            }
+            candidate["metrics"] = self._compute_candidate_metrics(candidate)
+            self.compute_shell_entropy_curvature_map(candidate)
+            generated_ligands.append(candidate)
         ml_section: Dict[str, Any] = {}
-        all_candidates = inverse_set["candidates"] + scaffold_set["candidates"]
+        all_candidates = list(generated_ligands)
+        combined = {
+            "reportId": f"lig-rep-{pocket_id}",
+            "lambdaContextUsed": lambda_context_snapshot,
+            "inverseDesign": {
+                "engine": (self.inverse_engine.describe() if self.inverse_engine else {}),
+                "seedLigands": seed_smiles,
+            },
+        }
+        accepted_candidates = [
+            candidate for candidate in all_candidates if self._passes_acceptance_thresholds(candidate.get("metrics", {}))
+        ]
+        rejected_candidates = [candidate for candidate in all_candidates if candidate not in accepted_candidates]
+        stats_payload: Dict[str, Any] = {
+            "acceptedCount": len(accepted_candidates),
+            "rejectedCount": len(rejected_candidates),
+        }
+        if all_candidates:
+            metric_keys = ("lambdaAttractorScore", "dilationFactor", "referenceEnergyMean")
+            stats_payload["metricMeans"] = {
+                key: float(
+                    np.mean(
+                        [candidate.get("metrics", {}).get(key, 0.0) for candidate in all_candidates]
+                    )
+                )
+                for key in metric_keys
+            }
+        if not accepted_candidates:
+            logger.warning(
+                "%s acceptance filter rejected all ligands | stats=%s",
+                self.name,
+                stats_payload,
+            )
+        generated_ligands = copy.deepcopy(accepted_candidates)
+        fallback_payload = [copy.deepcopy(candidate) for candidate in rejected_candidates[:1]]
+        for fallback in fallback_payload:
+            fallback["isFallback"] = True
+        combined["generatedLigands"] = generated_ligands
+        combined["finalLigands"] = copy.deepcopy(generated_ligands)
+        if fallback_payload:
+            combined["fallbackLigands"] = fallback_payload
+        combined["stats"] = stats_payload
+        ligand_lambda_diag = generated_ligands[0].get("lambdaShellDiagnostics") if generated_ligands else None
+        descriptor_source = None
+        if ligand_lambda_diag and ligand_lambda_diag.get("descriptors"):
+            descriptor_source = ligand_lambda_diag.get("descriptors")
+        elif self.context.lambda_shells:
+            descriptor_source = self.context.lambda_shells
+        if descriptor_source:
+            per_shell_obs = [
+                {
+                    "shellIndex": idx,
+                    "lambdaEntropy": float(entry.get("lambdaEntropy", 0.0)),
+                    "lambdaOccupancy": float(entry.get("lambdaOccupancy", 0.0)),
+                    "lambdaLeakage": float(entry.get("lambdaLeakage", 0.0)),
+                }
+                for idx, entry in enumerate(descriptor_source)
+            ]
+            global_obs = {
+                "lambdaAttractorScore": float(
+                    np.mean([entry.get("lambdaBhattacharyya", 0.0) for entry in descriptor_source])
+                ),
+                "lambdaEntropyGradient": float(
+                    descriptor_source[-1].get("lambdaEntropy", 0.0) - descriptor_source[0].get("lambdaEntropy", 0.0)
+                    if len(descriptor_source) > 1
+                    else 0.0
+                ),
+                "lambdaBhattacharyyaFlux": float(
+                    np.std([entry.get("lambdaBhattacharyya", 0.0) for entry in descriptor_source])
+                ),
+            }
+            self.observation_state["lambdaObservables"] = {"perShell": per_shell_obs, "global": global_obs}
         if self.feature_extractor and self.dataset_manager and self.ml_registry and all_candidates:
             task_name = "ligand.bindingAffinity"
             features = []
@@ -3183,7 +3858,7 @@ class LigandDiscoveryAgent(AgentBase):
             risk_task = "ligand.offTargetRisk"
             if features:
                 for candidate, feat in zip(all_candidates, features):
-                    flag = 1.0 if any(alert.get("issue") for alert in motif_alerts if alert["ligandId"] == candidate.get("ligandId")) else 0.0
+                    flag = 0.0
                     self.dataset_manager.register_record(
                         risk_task,
                         feat,
@@ -3264,16 +3939,123 @@ class LigandDiscoveryAgent(AgentBase):
                         self.ml_api.register_endpoint("ligand/risk", risk_task, risk_model.version)
                         self.ml_api.log_call(
                             "ligand/risk",
-                            {"ligands": [meta["ligandId"] for meta in metadata_bundle]},
-                            {"riskPredictions": risk_predictions},
-                        )
+                        {"ligands": [meta["ligandId"] for meta in metadata_bundle]},
+                        {"riskPredictions": risk_predictions},
+                    )
         combined["mlAugmentation"] = ml_section
+        pretrained_meta: Dict[str, Any] = {}
+        if generated_ligands:
+            affinity_model = self.ml_models.get("affinity")
+            if affinity_model:
+                pretrained_meta["affinity"] = affinity_model.describe()
+                for candidate in generated_ligands:
+                    smiles = candidate.get("smiles") or candidate.get("ligandId", "")
+                    score = affinity_model.score(smiles)
+                    candidate["mlAffinityScore"] = float(-5.0 - 6.0 * score)
+            else:
+                self._log_ml_fallback("affinity")
+                for candidate in generated_ligands:
+                    smiles = candidate.get("smiles") or candidate.get("ligandId", "")
+                    score = self._heuristic_model_score("affinity", smiles)
+                    candidate["mlAffinityScore"] = float(-5.0 - 6.0 * score)
+            synth_model = self.ml_models.get("synthesis")
+            if synth_model:
+                pretrained_meta["synthesis"] = synth_model.describe()
+                for candidate in generated_ligands:
+                    score = synth_model.score(candidate.get("ligandId", ""))
+                    candidate["mlSynthesisFeasibility"] = float(np.clip(score, 0.0, 1.0))
+            else:
+                self._log_ml_fallback("synthesis")
+                for candidate in generated_ligands:
+                    score = self._heuristic_model_score("synthesis", candidate.get("ligandId", ""))
+                    candidate["mlSynthesisFeasibility"] = float(np.clip(score, 0.0, 1.0))
+        if pretrained_meta:
+            combined.setdefault("mlAugmentation", {}).setdefault("pretrainedModels", {}).update(pretrained_meta)
         validated = self.validator.validate(self.name, combined)
+        await self.blackboard.post("ProposedLigands", validated)
         await self.blackboard.post("ligands", validated)
         return validated
 
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        baseline = self._reward_baseline()
+        binding_energy = float(primitives.get("binding_energy", -8.0))
+        reference_energy = float(primitives.get("reference_energy", -7.0))
+        off_target_energy = float(primitives.get("off_target_energy", binding_energy + 1.5))
+        entropy = primitives.get("entropy_per_shell") or [self.context.entanglement_entropy]
+        leakage = primitives.get("leakage") or [0.0]
+        curvature_gradient = float(primitives.get("curvature_gradient", 0.0))
+        occ_curr = primitives.get("occupancy")
+        if occ_curr is None:
+            occ_curr = []
+        occ_prev = primitives.get("occupancy_prev")
+        if occ_prev is None:
+            occ_prev = []
+        shell_delta = float(primitives.get("shellEntropyDelta", 0.0))
+        toxicity_prob = float(primitives.get("toxicity_prob", 0.3))
+        toxicity_unc = float(primitives.get("toxicity_uncertainty", 0.1))
+        ip_distance = float(primitives.get("ip_distance", 0.5))
+        ip_scale = float(primitives.get("ip_scale", 0.3))
+        num_accepted = int(primitives.get("num_accepted", 0))
+        beam_width = int(primitives.get("beam_width", max(len(occ_curr), 1)))
+        diversity_index = float(primitives.get("diversity_index", 0.0))
+        entropy_mean = float(primitives.get("entropy_mean", np.mean(entropy)))
+        energy_signal = binding_energy
+        R_bind = RewardPrimitives.R_bind(binding_energy, reference_energy)
+        R_select = RewardPrimitives.R_select(binding_energy, off_target_energy)
+        R_safety = RewardPrimitives.R_safety(toxicity_prob, toxicity_unc)
+        R_ip = RewardPrimitives.R_IP(ip_distance, max(ip_scale, 1e-3))
+        R_lambda = RewardPrimitives.R_lambda(entropy, curvature_gradient, leakage)
+        R_flow = RewardPrimitives.R_lambda_flow(occ_curr, occ_prev, shell_delta)
+        R_comp = RewardPrimitives.R_compress(
+            bool(primitives.get("is_compressed", False)),
+            float(primitives.get("compression_ratio", 0.0)),
+            bool(primitives.get("basis_mismatch", False)),
+            k_c=0.25,
+            k_b=0.15,
+        )
+        R_accept = RewardPrimitives.R_accept_ligand(num_accepted, max(beam_width, 1))
+        R_div = RewardPrimitives.R_diversity(diversity_index)
+        Q_ligand = (
+            0.35 * R_bind
+            + 0.10 * R_select
+            + 0.20 * R_safety
+            + 0.15 * R_ip
+            + 0.05 * R_lambda
+            + 0.05 * R_flow
+            + 0.02 * R_comp
+            + 0.05 * R_accept
+            + 0.03 * R_div
+        )
+        R_dd = RewardPrimitives.R_dd(Q_ligand, baseline["max_quality"], lambda_dd=0.3)
+        window = baseline["quality_window"] + [Q_ligand]
+        R_vol = RewardPrimitives.R_vol(window, lambda_vol=0.3)
+        R_stag = RewardPrimitives.R_stagnation(
+            Q_ligand,
+            baseline["prev_quality"],
+            entropy_mean,
+            baseline["prev_entropy"],
+            energy_signal,
+            baseline["prev_energy"],
+            lambda_stag=0.4,
+        )
+        validator = primitives.get("validatorDiagnostics", {})
+        R_val = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.05,
+            lambda_clamp=0.02,
+        )
+        total = float(Q_ligand + R_dd + R_vol + R_stag + R_val)
+        self._record_quality(Q_ligand, entropy_mean, energy_signal)
+        self.reward_history.append(total)
+        return total
+
 
 class QuantumSimulationAgent(AgentBase):
+    ACTION_SPACE = {
+        "accuracy_vs_speed": (0.0, 1.0),
+        "sampling_density": (0.25, 2.5),
+    }
     def __init__(
         self,
         blackboard: QuantumBlackboard,
@@ -3286,6 +4068,7 @@ class QuantumSimulationAgent(AgentBase):
         feature_extractor: Optional[FeatureExtractor] = None,
         active_learning: Optional[ActiveLearningCoordinator] = None,
         ml_api: Optional[MLInferenceAPI] = None,
+        quantum_config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             "QuantumSimulationAgent",
@@ -3300,13 +4083,47 @@ class QuantumSimulationAgent(AgentBase):
         )
         self.uniprot_meta = uniprot_meta
         self.quantum_reference = quantum_reference
+        self.quantum_config = {
+            "alpha_calibration": 0.3,
+            "enable_pm6": True,
+            "mmff_pre_screen_threshold": -3.0,
+        }
+        if quantum_config:
+            self.quantum_config.update(quantum_config)
+
+    def compute_mmff_energy(self, smiles: str) -> float:
+        baseline = -6.0 - 0.4 * self.context.enhancement_factor
+        descriptor = _deterministic_score(f"mmff:{smiles}")
+        return float(baseline - 2.0 * (descriptor - 0.5))
+
+    def compute_pm6_energy(self, smiles: str, mmff_energy: Optional[float] = None) -> float:
+        mmff = mmff_energy if mmff_energy is not None else self.compute_mmff_energy(smiles)
+        descriptor = _deterministic_score(f"pm6:{smiles}")
+        return float(mmff - 0.8 - 0.6 * descriptor)
+
+    def apply_lambda_shell_correction(
+        self, energy: float, lambda_stats: Optional[Dict[str, Any]]
+    ) -> float:
+        stats = lambda_stats or {}
+        entropy = float(stats.get("entropyMean", self.context.entanglement_entropy))
+        curvature = float(stats.get("curvatureMean", 0.0))
+        correction = -0.15 * entropy + 0.05 * curvature
+        return float(energy + correction)
+        self.quantum_config = {
+            "alpha_calibration": 0.3,
+            "enable_pm6": True,
+            "mmff_pre_screen_threshold": -3.0,
+        }
+        if quantum_config:
+            self.quantum_config.update(quantum_config)
 
     def simulate_quantum_state(
         self,
         binding_site: Optional[Dict[str, Any]],
         ligand_diag: Optional[Dict[str, Any]],
+        sampling_density: float = 1.0,
     ) -> Dict[str, Any]:
-        epsilon = 0.01
+        epsilon = 0.01 * sampling_density
         scales = [1.0, max(LAMBDA_DILATION - epsilon, 0.1), LAMBDA_DILATION + epsilon]
         base_descriptors = []
         if binding_site and binding_site.get("pockets"):
@@ -3410,172 +4227,341 @@ class QuantumSimulationAgent(AgentBase):
             )
         return report
 
-    async def run(self) -> Dict[str, Any]:
+    async def run(
+        self,
+        context_override: Optional[QuantumContext] = None,
+        ligand_report: Optional[Dict[str, Any]] = None,
+        action_vector: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        actions = self._prepare_action_vector(action_vector)
+        accuracy = float(actions.get("accuracy_vs_speed", 0.5))
+        sampling_density = float(actions.get("sampling_density", 1.0))
         binding_report = await self.blackboard.read("binding")
-        ligand_report = await self.blackboard.read("ligands")
-        ligand_id = "lig-novel-001"
-        smiles = ""
-        if ligand_report and ligand_report.get("inverse", {}).get("candidates"):
-            ligand_id = ligand_report["inverse"]["candidates"][0]["ligandId"]
-            smiles = ligand_report["inverse"]["candidates"][0].get("smiles", "")
-        ligand_lambda = None
-        if ligand_report:
-            for bucket in ("inverse", "scaffold"):
-                candidates = ligand_report.get(bucket, {}).get("candidates", [])
-                if candidates and candidates[0].get("lambdaShellDiagnostics"):
-                    ligand_lambda = candidates[0]["lambdaShellDiagnostics"]
-                    break
-        lambda_shift = self.simulate_quantum_state(binding_report, ligand_lambda)
-        pose = self._simulate_pose(ligand_id, ligand_lambda)
-        pose["lambdaShiftDiagnostics"] = lambda_shift
-        ml_section: Dict[str, Any] = {}
-        if self.feature_extractor and self.dataset_manager and self.ml_registry:
-            sample = {
-                "ligandId": ligand_id,
-                "bindingEnergy": pose["bindingAffinityScore"],
-                "entanglementEntropy": self.context.entanglement_entropy,
-                "orbitalOccupations": self.quantum_reference.get("samples", [{}])[0].get("orbitalOccupations", [0.25, 0.25, 0.25, 0.25]),
-                "lambdaShellFingerprint": (ligand_lambda or {}).get("summary", {}).get(
-                    "lambdaShellFingerprint", (ligand_lambda or {}).get("fingerprint", [])
+        report_payload = ligand_report or await self.blackboard.read("ProposedLigands")
+        if not report_payload:
+            report_payload = await self.blackboard.read("ligands")
+        candidate_pool = (report_payload or {}).get("generatedLigands") or (report_payload or {}).get("finalLigands") or []
+        valid_candidates = validate_ligand_entries(candidate_pool)
+        if not valid_candidates and report_payload:
+            valid_candidates = validate_ligand_entries(report_payload.get("fallbackLigands", []))
+        if not valid_candidates:
+            lambda_stats_default = QuantumContext.shell_statistics(self.context.lambda_shells)
+            fallback_candidate = {
+                "ligandId": "lig-novel-001",
+                "smiles": "c1ccccc1",
+                "lambdaShellDiagnostics": {"descriptors": self.context.lambda_shells},
+                "metrics": {
+                    "lambdaAttractorScore": 0.4,
+                    "dilationFactor": 1.0,
+                    "referenceEnergyMean": float(self.quantum_reference.get("statistics", {}).get("meanEnergy", -8.0)),
+                    "lambdaShellStats": lambda_stats_default,
+                },
+            }
+            valid_candidates = [fallback_candidate]
+        descriptor_source = None
+        if candidate_pool:
+            diag = candidate_pool[0].get("lambdaShellDiagnostics")
+            if diag and diag.get("descriptors"):
+                descriptor_source = diag.get("descriptors")
+        if descriptor_source is None and self.context.lambda_shells:
+            descriptor_source = self.context.lambda_shells
+        if descriptor_source:
+            per_shell_obs = [
+                {
+                    "shellIndex": idx,
+                    "lambdaEntropy": float(entry.get("lambdaEntropy", 0.0)),
+                    "lambdaOccupancy": float(entry.get("lambdaOccupancy", 0.0)),
+                    "lambdaLeakage": float(entry.get("lambdaLeakage", 0.0)),
+                }
+                for idx, entry in enumerate(descriptor_source)
+            ]
+            global_obs = {
+                "lambdaAttractorScore": float(
+                    np.mean([entry.get("lambdaBhattacharyya", 0.0) for entry in descriptor_source])
+                ),
+                "lambdaEntropyGradient": float(
+                    descriptor_source[-1].get("lambdaEntropy", 0.0) - descriptor_source[0].get("lambdaEntropy", 0.0)
+                    if len(descriptor_source) > 1
+                    else 0.0
+                ),
+                "lambdaBhattacharyyaFlux": float(
+                    np.std([entry.get("lambdaBhattacharyya", 0.0) for entry in descriptor_source])
                 ),
             }
-            quantum_feat = self.feature_extractor.featurize_quantum_sample(sample)
-            smiles_feat = self.feature_extractor.featurize_smiles(smiles or ligand_id)
-            lambda_feat = self.feature_extractor.featurize_lambda_shells(
-                (ligand_lambda or {}).get("descriptors", self.context.lambda_shells)
-            )
-            feature_vec = self.feature_extractor.combine_features(quantum_feat, smiles_feat, lambda_feat)
-            task_name = "quantum.bindingEnergy"
-            self.dataset_manager.register_record(
-                task_name,
-                feature_vec,
-                pose["bindingAffinityScore"],
-                {"ligandId": ligand_id, "source": "quantum_agent"},
-            )
-            split = self.dataset_manager.build_split(task_name)
-            model = self.ml_registry.get_model(task_name)
-            if model is None and split.train_X.size:
-                model = GraphSurrogateModel(f"{task_name}-surrogate")
-                metrics = model.train(split)
-                self.ml_registry.register_model(task_name, model, metrics, split.metadata)
-                training_record = lambda_shell_training_hook(
-                    self.name,
-                    self.context,
-                    ligand_lambda or {"descriptors": self.context.lambda_shells},
+            self.observation_state["lambdaObservables"] = {"perShell": per_shell_obs, "global": global_obs}
+        per_ligand_reports: List[Dict[str, Any]] = []
+        best_affinity: Optional[Dict[str, Any]] = None
+        best_docking: Optional[Dict[str, Any]] = None
+        best_dataset: Optional[Dict[str, Any]] = None
+        base_alpha = float(self.quantum_config.get("alpha_calibration", 0.3))
+        alpha = float(np.clip(base_alpha + 0.1 * (accuracy - 0.5), 0.2, 0.5))
+        base_threshold = float(self.quantum_config.get("mmff_pre_screen_threshold", -3.0))
+        mmff_threshold = base_threshold + (0.5 - accuracy)
+        enable_pm6 = bool(accuracy > 0.2 and self.quantum_config.get("enable_pm6", True))
+        for candidate in valid_candidates:
+            ligand_id = candidate.get("ligandId", "lig-novel-001")
+            smiles = candidate.get("smiles") or ligand_id
+            ligand_lambda = candidate.get("lambdaShellDiagnostics")
+            lambda_stats = candidate.get("metrics", {}).get("lambdaShellStats")
+            if not lambda_stats:
+                descriptors = (ligand_lambda or {}).get("descriptors", self.context.lambda_shells)
+                lambda_stats = QuantumContext.shell_statistics(descriptors)
+            mmff_energy = self.compute_mmff_energy(smiles)
+            if mmff_energy > mmff_threshold or not enable_pm6:
+                quantum_energy = mmff_energy
+            else:
+                quantum_energy = self.compute_pm6_energy(smiles, mmff_energy)
+            lambda_corrected = self.apply_lambda_shell_correction(quantum_energy, lambda_stats)
+            binding_energy = lambda_corrected + alpha * (mmff_energy - lambda_corrected)
+            binding_energy = float(np.clip(binding_energy, -25.0, -3.0))
+            lambda_shift = self.simulate_quantum_state(binding_report, ligand_lambda, sampling_density)
+            pose = self._simulate_pose(ligand_id, ligand_lambda)
+            pose["bindingAffinityScore"] = binding_energy
+            pose["lambdaShiftDiagnostics"] = lambda_shift
+            ml_section: Dict[str, Any] = {}
+            if self.feature_extractor and self.dataset_manager and self.ml_registry:
+                sample = {
+                    "ligandId": ligand_id,
+                    "bindingEnergy": pose["bindingAffinityScore"],
+                    "entanglementEntropy": self.context.entanglement_entropy,
+                    "orbitalOccupations": self.quantum_reference.get("samples", [{}])[0].get("orbitalOccupations", [0.25, 0.25, 0.25, 0.25]),
+                    "lambdaShellFingerprint": (ligand_lambda or {}).get("summary", {}).get(
+                        "lambdaShellFingerprint", (ligand_lambda or {}).get("fingerprint", [])
+                    ),
+                }
+                quantum_feat = self.feature_extractor.featurize_quantum_sample(sample)
+                smiles_feat = self.feature_extractor.featurize_smiles(smiles)
+                lambda_feat = self.feature_extractor.featurize_lambda_shells(
+                    (ligand_lambda or {}).get("descriptors", self.context.lambda_shells)
                 )
-                self.observation_state.setdefault("trainingLogs", []).append(training_record)
-            high_task = "quantum.highAffinity"
-            label = 1.0 if pose["bindingAffinityScore"] < self.quantum_reference.get("statistics", {}).get("meanEnergy", -8.0) else 0.0
-            self.dataset_manager.register_record(
-                high_task,
-                feature_vec,
-                label,
-                {"ligandId": ligand_id, "source": "quantum_agent"},
-            )
-            high_split = self.dataset_manager.build_split(high_task)
-            classifier = self.ml_registry.get_model(high_task)
-            if classifier is None and high_split.train_X.size:
-                classifier = SimpleClassifier(f"{high_task}-clf", architecture="LogisticProxy")
-                metrics = classifier.train(high_split)
-                self.ml_registry.register_model(high_task, classifier, metrics, high_split.metadata)
-                training_record = lambda_shell_training_hook(
-                    f"{self.name}-highAffinity",
-                    self.context,
-                    ligand_lambda or {"descriptors": self.context.lambda_shells},
+                feature_vec = self.feature_extractor.combine_features(quantum_feat, smiles_feat, lambda_feat)
+                task_name = "quantum.bindingEnergy"
+                self.dataset_manager.register_record(
+                    task_name,
+                    feature_vec,
+                    pose["bindingAffinityScore"],
+                    {"ligandId": ligand_id, "source": "quantum_agent"},
                 )
-                self.observation_state.setdefault("trainingLogs", []).append(training_record)
-            if model:
-                normalization = split.normalization if split else {"mean": np.zeros_like(feature_vec), "std": np.ones_like(feature_vec)}
-                norm_feat = (
-                    (feature_vec - normalization["mean"]) / normalization["std"]
-                    if isinstance(normalization, dict)
-                    else feature_vec
-                )
-                preds, uncert = model.predict_with_uncertainty(norm_feat.reshape(1, -1))
-                pose["bindingAffinityScore"] = float(np.mean([pose["bindingAffinityScore"], preds[0]]))
-                affinity_prediction = float(preds[0])
-                uncertainty = float(uncert[0])
-                high_pred: Optional[Dict[str, Any]] = None
-                if classifier:
-                    high_norm = (
-                        (feature_vec - high_split.normalization["mean"]) / high_split.normalization["std"]
-                        if high_split and isinstance(high_split.normalization, dict)
-                        else norm_feat
+                split = self.dataset_manager.build_split(task_name)
+                model = self.ml_registry.get_model(task_name)
+                if model is None and split.train_X.size:
+                    model = GraphSurrogateModel(f"{task_name}-surrogate")
+                    metrics = model.train(split)
+                    self.ml_registry.register_model(task_name, model, metrics, split.metadata)
+                    training_record = lambda_shell_training_hook(
+                        self.name,
+                        self.context,
+                        ligand_lambda or {"descriptors": self.context.lambda_shells},
                     )
-                    risk_score, risk_unc = classifier.predict_with_uncertainty(high_norm.reshape(1, -1))
-                    high_pred = {
-                        "highAffinityProbability": float(risk_score[0]),
-                        "uncertainty": float(risk_unc[0]),
+                    self.observation_state.setdefault("trainingLogs", []).append(training_record)
+                high_task = "quantum.highAffinity"
+                label = 1.0 if pose["bindingAffinityScore"] < self.quantum_reference.get("statistics", {}).get("meanEnergy", -8.0) else 0.0
+                self.dataset_manager.register_record(
+                    high_task,
+                    feature_vec,
+                    label,
+                    {"ligandId": ligand_id, "source": "quantum_agent"},
+                )
+                high_split = self.dataset_manager.build_split(high_task)
+                classifier = self.ml_registry.get_model(high_task)
+                if classifier is None and high_split.train_X.size:
+                    classifier = SimpleClassifier(f"{high_task}-clf", architecture="LogisticProxy")
+                    metrics = classifier.train(high_split)
+                    self.ml_registry.register_model(high_task, classifier, metrics, high_split.metadata)
+                    training_record = lambda_shell_training_hook(
+                        f"{self.name}-highAffinity",
+                        self.context,
+                        ligand_lambda or {"descriptors": self.context.lambda_shells},
+                    )
+                    self.observation_state.setdefault("trainingLogs", []).append(training_record)
+                if model:
+                    normalization = split.normalization if split else {"mean": np.zeros_like(feature_vec), "std": np.ones_like(feature_vec)}
+                    norm_feat = (
+                        (feature_vec - normalization["mean"]) / normalization["std"]
+                        if isinstance(normalization, dict)
+                        else feature_vec
+                    )
+                    preds, uncert = model.predict_with_uncertainty(norm_feat.reshape(1, -1))
+                    pose["bindingAffinityScore"] = float(np.mean([pose["bindingAffinityScore"], preds[0]]))
+                    affinity_prediction = float(preds[0])
+                    uncertainty = float(uncert[0])
+                    high_pred: Optional[Dict[str, Any]] = None
+                    if classifier:
+                        high_norm = (
+                            (feature_vec - high_split.normalization["mean"]) / high_split.normalization["std"]
+                            if high_split and isinstance(high_split.normalization, dict)
+                            else norm_feat
+                        )
+                        risk_score, risk_unc = classifier.predict_with_uncertainty(high_norm.reshape(1, -1))
+                        high_pred = {
+                            "highAffinityProbability": float(risk_score[0]),
+                            "uncertainty": float(risk_unc[0]),
+                        }
+                        if self.active_learning:
+                            self.active_learning.evaluate_samples(
+                                high_task,
+                                [feature_vec],
+                                risk_score,
+                                risk_unc,
+                                [{"ligandId": ligand_id}],
+                            )
+                    ml_section = {
+                        "bindingEnergyModel": model.describe(),
+                        "predictedBindingEnergy": affinity_prediction,
+                        "uncertainty": uncertainty,
+                        "highAffinity": high_pred,
+                        "dataset": split.metadata if split else {"records": 0},
                     }
                     if self.active_learning:
                         self.active_learning.evaluate_samples(
-                            high_task,
+                            task_name,
                             [feature_vec],
-                            risk_score,
-                            risk_unc,
+                            preds,
+                            uncert,
                             [{"ligandId": ligand_id}],
                         )
-                ml_section = {
-                    "bindingEnergyModel": model.describe(),
-                    "predictedBindingEnergy": affinity_prediction,
-                    "uncertainty": uncertainty,
-                    "highAffinity": high_pred,
-                    "dataset": split.metadata if split else {"records": 0},
-                }
-                if self.active_learning:
-                    self.active_learning.evaluate_samples(
-                        task_name,
-                        [feature_vec],
-                        preds,
-                        uncert,
-                        [{"ligandId": ligand_id}],
-                    )
-                if self.ml_api:
-                    self.ml_api.register_endpoint("quantum/binding", task_name, model.version)
-                    self.ml_api.log_call(
-                        "quantum/binding",
-                        {"ligandId": ligand_id},
-                        {"predictedBindingEnergy": affinity_prediction, "uncertainty": uncertainty},
-                    )
-                    if classifier:
-                        self.ml_api.register_endpoint("quantum/highAffinity", high_task, classifier.version)
+                    if self.ml_api:
+                        self.ml_api.register_endpoint("quantum/binding", task_name, model.version)
                         self.ml_api.log_call(
-                            "quantum/highAffinity",
+                            "quantum/binding",
                             {"ligandId": ligand_id},
-                            {"highAffinity": high_pred},
+                            {"predictedBindingEnergy": affinity_prediction, "uncertainty": uncertainty},
                         )
-        docking_report = {
-            "reportId": f"dock-rep-{ligand_id}",
-            "sourceLigandId": ligand_id,
-            "poses": [pose],
-        }
-        affinity_report = self._binding_affinity(ligand_id, pose, ligand_lambda)
-        affinity_report["lambdaShiftStabilityScore"] = lambda_shift.get("lambdaShiftStabilityScore", 1.0)
-        if ml_section:
-            docking_report["mlAugmentation"] = ml_section
-            affinity_report["mlAugmentation"] = ml_section
-        quantum_dataset = {
-            "generatedPoseLibrary": [pose],
-            "quantumReference": self.quantum_reference,
-            "lambdaShellDiagnostics": ligand_lambda,
-        }
-        validated_docking = self.validator.validate(self.name, docking_report)
-        validated_affinity = self.validator.validate(self.name, affinity_report)
-        validated_dataset = self.validator.validate(
-            self.name,
-            {
+                        if classifier:
+                            self.ml_api.register_endpoint("quantum/highAffinity", high_task, classifier.version)
+                            self.ml_api.log_call(
+                                "quantum/highAffinity",
+                                {"ligandId": ligand_id},
+                                {"highAffinity": high_pred},
+                            )
+            docking_report = {
+                "reportId": f"dock-rep-{ligand_id}",
+                "sourceLigandId": ligand_id,
+                "poses": [pose],
+            }
+            affinity_report = self._binding_affinity(ligand_id, pose, ligand_lambda)
+            affinity_report["bindingFreeEnergy"] = binding_energy
+            affinity_report["lambdaShiftStabilityScore"] = lambda_shift.get("lambdaShiftStabilityScore", 1.0)
+            affinity_report["hybridEnergyPipeline"] = {
+                "rawQuantumEnergy": float(quantum_energy),
+                "mmffEnergy": float(mmff_energy),
+                "lambdaCorrection": float(lambda_corrected - quantum_energy),
+                "alphaCalibration": alpha,
+                "lambdaStats": lambda_stats,
+            }
+            reference_energy = self.quantum_reference.get("statistics", {}).get("meanEnergy", binding_energy)
+            energy_bounds = self.quantum_reference.get("statistics", {}).get(
+                "energyRange", {"min": -60.0, "max": -0.5}
+            )
+            affinity_report["referenceComparison"] = {
+                "deltaFromQuantumMean": float(binding_energy - reference_energy),
+                "withinReferenceBounds": bool(energy_bounds["min"] <= binding_energy <= energy_bounds["max"]),
+            }
+            if ml_section:
+                docking_report["mlAugmentation"] = ml_section
+                affinity_report["mlAugmentation"] = ml_section
+            quantum_dataset = {
                 "reportId": f"quant-dataset-{ligand_id}",
                 "sourceLigandId": ligand_id,
-                "dataset": quantum_dataset,
-            },
+                "dataset": {
+                    "generatedPoseLibrary": [pose],
+                    "quantumReference": self.quantum_reference,
+                    "lambdaShellDiagnostics": ligand_lambda,
+                },
+            }
+            validated_docking = self.validator.validate(self.name, docking_report)
+            validated_affinity = self.validator.validate(self.name, affinity_report)
+            validated_dataset = self.validator.validate(self.name, quantum_dataset)
+            per_ligand_reports.append(
+                {
+                    "ligandId": ligand_id,
+                    "smiles": smiles,
+                    "bindingFreeEnergy": binding_energy,
+                    "docking": validated_docking,
+                    "affinity": validated_affinity,
+                    "quantumDataset": validated_dataset,
+                }
+            )
+            if best_affinity is None or binding_energy < best_affinity.get("bindingFreeEnergy", 1e6):
+                best_affinity = validated_affinity
+                best_docking = validated_docking
+                best_dataset = validated_dataset
+        if best_affinity is None or best_docking is None or best_dataset is None:
+            best_affinity = per_ligand_reports[0]["affinity"]
+            best_docking = per_ligand_reports[0]["docking"]
+            best_dataset = per_ligand_reports[0]["quantumDataset"]
+        await self.blackboard.post("docking", best_docking)
+        await self.blackboard.post("quantum", best_affinity)
+        await self.blackboard.post("quantumDataset", best_dataset)
+        return {
+            "best": best_affinity,
+            "docking": best_docking,
+            "quantumDataset": best_dataset,
+            "perLigand": per_ligand_reports,
+        }
+
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        baseline = self._reward_baseline()
+        binding_energy = float(primitives.get("binding_energy", -8.0))
+        reference_energy = float(primitives.get("reference_energy", -7.0))
+        entropy = primitives.get("entropy_per_shell") or [self.context.entanglement_entropy]
+        leakage = primitives.get("leakage") or [0.0]
+        curvature_gradient = float(primitives.get("curvature_gradient", 0.0))
+        occ_curr = primitives.get("occupancy")
+        if occ_curr is None:
+            occ_curr = []
+        occ_prev = primitives.get("occupancy_prev")
+        if occ_prev is None:
+            occ_prev = []
+        shell_delta = float(primitives.get("shellEntropyDelta", 0.0))
+        mmff_energy = float(primitives.get("mmff_energy", binding_energy))
+        lambda_corr = float(primitives.get("lambda_correction", 0.0))
+        phys_term = float(
+            np.tanh(
+                max(0.0, 1.0 - 0.1 * abs(mmff_energy - binding_energy))
+                + max(0.0, 1.0 - 0.1 * abs(lambda_corr))
+            )
         )
-        await self.blackboard.post("docking", validated_docking)
-        await self.blackboard.post("quantum", validated_affinity)
-        await self.blackboard.post("quantumDataset", validated_dataset)
-        return {"docking": validated_docking, "affinity": validated_affinity, "quantumDataset": validated_dataset}
+        R_bind = RewardPrimitives.R_bind(binding_energy, reference_energy)
+        R_lambda = RewardPrimitives.R_lambda(entropy, curvature_gradient, leakage)
+        R_flow = RewardPrimitives.R_lambda_flow(occ_curr, occ_prev, shell_delta)
+        R_comp = RewardPrimitives.R_compress(
+            bool(primitives.get("is_compressed", False)),
+            float(primitives.get("compression_ratio", 0.0)),
+            bool(primitives.get("basis_mismatch", False)),
+            k_c=0.2,
+            k_b=0.15,
+        )
+        Q_quantum = 0.5 * phys_term + 0.2 * R_bind + 0.1 * R_lambda + 0.1 * R_flow + 0.1 * R_comp
+        entropy_mean = float(primitives.get("entropy_mean", np.mean(entropy)))
+        energy_signal = binding_energy
+        R_dd = RewardPrimitives.R_dd(Q_quantum, baseline["max_quality"], lambda_dd=0.2)
+        R_stag = RewardPrimitives.R_stagnation(
+            Q_quantum,
+            baseline["prev_quality"],
+            entropy_mean,
+            baseline["prev_entropy"],
+            energy_signal,
+            baseline["prev_energy"],
+            lambda_stag=0.3,
+        )
+        validator = primitives.get("validatorDiagnostics", {})
+        R_val = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.1,
+            lambda_clamp=0.03,
+        )
+        total = float(Q_quantum + R_dd + R_stag + R_val)
+        self._record_quality(Q_quantum, entropy_mean, energy_signal)
+        self.reward_history.append(total)
+        return total
 
 
 class SynthesisPlannerAgent(AgentBase):
+    ACTION_SPACE = {
+        "retrosynthesis_aggressiveness": (0.5, 2.5),
+    }
     def __init__(
         self,
         blackboard: QuantumBlackboard,
@@ -3587,6 +4573,7 @@ class SynthesisPlannerAgent(AgentBase):
         feature_extractor: Optional[FeatureExtractor] = None,
         active_learning: Optional[ActiveLearningCoordinator] = None,
         ml_api: Optional[MLInferenceAPI] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             "SynthesisPlannerAgent",
@@ -3598,26 +4585,32 @@ class SynthesisPlannerAgent(AgentBase):
             feature_extractor=feature_extractor,
             active_learning=active_learning,
             ml_api=ml_api,
+            config=config,
         )
         self.llm = llm
 
-    async def run(self) -> Dict[str, Any]:
-        quantum_report = await self.blackboard.read("quantum")
-        ligand_report = await self.blackboard.read("ligands")
-        ligand_id = quantum_report["sourceLigandId"] if quantum_report else "lig-novel-001"
-        ligand_lambda = None
-        if ligand_report:
-            for bucket in ("scaffold", "inverse"):
-                candidates = ligand_report.get(bucket, {}).get("candidates", [])
-                if candidates and candidates[0].get("lambdaShellDiagnostics"):
-                    ligand_lambda = candidates[0]["lambdaShellDiagnostics"]
-                    break
-        if ligand_lambda is None and quantum_report and quantum_report.get("lambdaShellDiagnostics"):
-            ligand_lambda = quantum_report.get("lambdaShellDiagnostics")
+    async def run(
+        self,
+        context_override: Optional[QuantumContext] = None,
+        ligand_report: Optional[Dict[str, Any]] = None,
+        quantum_report: Optional[Dict[str, Any]] = None,
+        action_vector: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        actions = self._prepare_action_vector(action_vector)
+        aggressiveness = float(actions.get("retrosynthesis_aggressiveness", 1.0))
+        quantum_payload = quantum_report or await self.blackboard.read("quantum")
+        report_payload = ligand_report or await self.blackboard.read("ProposedLigands")
+        if not report_payload:
+            report_payload = await self.blackboard.read("ligands")
+        candidate_pool = (report_payload or {}).get("generatedLigands") or (report_payload or {}).get("finalLigands") or []
+        ligand_lambda = candidate_pool[0].get("lambdaShellDiagnostics") if candidate_pool else None
+        if ligand_lambda is None and quantum_payload and quantum_payload.get("best", {}).get("lambdaShellDiagnostics"):
+            ligand_lambda = quantum_payload["best"].get("lambdaShellDiagnostics")
+        context_in_use = context_override or self.context
         prompt = textwrap.dedent(
-            f"""
-            Design a three-step synthetic route for ligand {ligand_id} optimizing yield under quantum-enhanced conditions.
-            Incorporate ?-scale invariant considerations for solvent and catalyst selection.
+            """
+            Provide a concise lambda-aware synthesis outline balancing novelty with practical chemistry.
+            Emphasize solvent and catalyst choices compatible with inverse-designed ligands.
             """
         )
         plan_text = self.llm.complete(prompt)
@@ -3628,13 +4621,36 @@ class SynthesisPlannerAgent(AgentBase):
                 "Perform selective nitration guided by entanglement-aligned field gradients",
                 "Finalize via hydrogenation with lambda-stabilized palladium catalyst",
             ]
-        lambda_latent = self.encode_lambda_latent(ligand_lambda or {"descriptors": self.context.lambda_shells})
-        accessibility = None
-        if ligand_report and ligand_report.get("inverse"):
-            candidates = ligand_report["inverse"].get("candidates", [])
-            if candidates:
-                accessibility = candidates[0].get("syntheticAccessibility")
-        rationale = "Plan aligns with lambda-scale catalysts and avoids known reactive intermediates."
+        lambda_latent = self.encode_lambda_latent(ligand_lambda or {"descriptors": context_in_use.lambda_shells})
+        binding_lookup = {}
+        for entry in (quantum_payload or {}).get("perLigand", []):
+            binding_lookup[entry.get("ligandId")] = entry.get("bindingFreeEnergy")
+        per_routes: List[Dict[str, Any]] = []
+        implausible: List[str] = []
+        novelty_threshold = float(np.clip(0.6 + 0.1 * (aggressiveness - 1.0), 0.45, 0.9))
+        for candidate in candidate_pool:
+            ligand_id = candidate.get("ligandId", "lig-novel-001")
+            novelty = float(candidate.get("noveltyScore", 0.5))
+            base_steps = int(candidate.get("syntheticSteps", 2))
+            steps = max(int(round(base_steps * aggressiveness)), 1)
+            if novelty > novelty_threshold:
+                steps = max(steps, int(round(2 * aggressiveness)))
+            feasibility = float(candidate.get("mlSynthesisFeasibility", 0.5))
+            binding_energy = binding_lookup.get(ligand_id)
+            implausible_flag = bool(binding_energy is not None and binding_energy < -8.0 and feasibility < 0.4)
+            if implausible_flag:
+                implausible.append(ligand_id)
+            per_routes.append(
+                {
+                    "ligandId": ligand_id,
+                    "noveltyScore": novelty,
+                    "syntheticSteps": steps,
+                    "feasibilityScore": feasibility,
+                    "bindingFreeEnergy": binding_energy,
+                    "implausible": implausible_flag,
+                }
+            )
+        accessibility = per_routes[0].get("feasibilityScore") if per_routes else 5.0
         flags = []
         if accessibility and accessibility > 6.5:
             flags.append(
@@ -3643,10 +4659,13 @@ class SynthesisPlannerAgent(AgentBase):
                     "message": "Route requires optimization to reduce complexity (score > 6.5)",
                 }
             )
+        rationale = "Plans align novelty with lambda-scale catalysts while respecting practical chemistry."
         report = {
-            "reportId": f"syn-rep-{ligand_id}",
-            "sourceLigandId": ligand_id,
+            "reportId": f"syn-rep-{per_routes[0]['ligandId']}" if per_routes else "syn-rep-lig-novel-001",
+            "sourceLigandId": per_routes[0]["ligandId"] if per_routes else "lig-novel-001",
             "steps": plan,
+            "perLigandRoutes": per_routes,
+            "implausibleLigands": implausible,
             "feasibilityAssessment": {
                 "syntheticAccessibility": accessibility if accessibility is not None else 5.0,
                 "flags": flags,
@@ -3654,8 +4673,13 @@ class SynthesisPlannerAgent(AgentBase):
             "rationale": rationale,
             "lambdaLatentTensor": lambda_latent.tolist(),
         }
+        report["consistencyChecks"] = {
+            "noveltyThreshold": novelty_threshold,
+            "contextEntropy": context_in_use.entanglement_entropy,
+        }
         if ligand_lambda:
             report["lambdaShellDiagnostics"] = ligand_lambda
+        primary_ligand_id = report["sourceLigandId"]
         if self.feature_extractor and self.dataset_manager and self.ml_registry:
             sequence = " ".join(plan)
             feature_vec = self.feature_extractor.featurize_sequence(sequence)
@@ -3664,13 +4688,27 @@ class SynthesisPlannerAgent(AgentBase):
             )
             combined_vec = self.feature_extractor.combine_features(feature_vec, lambda_feat)
             combined_vec = self.feature_extractor.combine_features(combined_vec, lambda_latent.flatten())
+            combined_vec = np.asarray(combined_vec, dtype=float).flatten()
+            target_dim = 64
+            if combined_vec.size < target_dim:
+                combined_vec = np.pad(combined_vec, (0, target_dim - combined_vec.size))
+            else:
+                combined_vec = combined_vec[:target_dim]
             task_name = "synthesis.successProbability"
+            existing = self.dataset_manager.records.get(task_name, [])
+            for record in existing:
+                vec = np.asarray(record["features"], dtype=float).flatten()
+                if vec.size < target_dim:
+                    vec = np.pad(vec, (0, target_dim - vec.size))
+                elif vec.size > target_dim:
+                    vec = vec[:target_dim]
+                record["features"] = vec
             label = 1.0 if not flags else 0.5
             self.dataset_manager.register_record(
                 task_name,
                 combined_vec,
                 label,
-                {"ligandId": ligand_id, "source": "synthesis_agent"},
+                {"ligandId": primary_ligand_id, "source": "synthesis_agent"},
             )
             split = self.dataset_manager.build_split(task_name)
             model = self.ml_registry.get_model(task_name)
@@ -3705,21 +4743,77 @@ class SynthesisPlannerAgent(AgentBase):
                         [feature_vec],
                         probs,
                         uncert,
-                        [{"ligandId": ligand_id}],
+                        [{"ligandId": primary_ligand_id}],
                     )
                 if self.ml_api:
                     self.ml_api.register_endpoint("synthesis/success", task_name, model.version)
                     self.ml_api.log_call(
                         "synthesis/success",
-                        {"ligandId": ligand_id},
+                        {"ligandId": primary_ligand_id},
                         {"successProbability": ml_section["successProbability"]},
                     )
+        pretrained_meta: Dict[str, Any] = {}
+        synthesis_model = self.ml_models.get("synthesis")
+        synthesis_identifier = " ".join(plan)
+        if synthesis_model:
+            pretrained_meta["synthesis"] = synthesis_model.describe()
+            score = synthesis_model.score(synthesis_identifier)
+        else:
+            self._log_ml_fallback("synthesis")
+            score = self._heuristic_model_score("synthesis", synthesis_identifier)
+        report.setdefault("feasibilityAssessment", {})["pretrainedSynthesisScore"] = float(np.clip(score, 0.0, 1.0))
+        if pretrained_meta:
+            report.setdefault("mlAugmentation", {}).setdefault("pretrainedModels", {}).update(pretrained_meta)
         validated = self.validator.validate(self.name, report)
         await self.blackboard.post("synthesis", validated)
         return validated
 
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        baseline = self._reward_baseline()
+        yield_estimate = float(primitives.get("yield_estimate", 0.6))
+        complexity = float(primitives.get("complexity", 0.5))
+        toxicity_prob = float(primitives.get("toxicity_prob", 0.3))
+        toxicity_unc = float(primitives.get("toxicity_uncertainty", 0.1))
+        entropy_mean = float(primitives.get("entropy_mean", self.context.entanglement_entropy))
+        energy_signal = float(primitives.get("energy_signal", 1.0 - complexity))
+        R_synth = RewardPrimitives.R_synth(yield_estimate, complexity)
+        R_safety = RewardPrimitives.R_safety(toxicity_prob, toxicity_unc)
+        R_comp = RewardPrimitives.R_compress(
+            bool(primitives.get("is_compressed", False)),
+            float(primitives.get("compression_ratio", 0.0)),
+            bool(primitives.get("basis_mismatch", False)),
+            k_c=0.2,
+            k_b=0.1,
+        )
+        Q_synth = 0.6 * R_synth + 0.2 * R_safety + 0.2 * R_comp
+        R_dd = RewardPrimitives.R_dd(Q_synth, baseline["max_quality"], lambda_dd=0.2)
+        R_stag = RewardPrimitives.R_stagnation(
+            Q_synth,
+            baseline["prev_quality"],
+            entropy_mean,
+            baseline["prev_entropy"],
+            energy_signal,
+            baseline["prev_energy"],
+            lambda_stag=0.2,
+        )
+        validator = primitives.get("validatorDiagnostics", {})
+        R_val = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.05,
+            lambda_clamp=0.02,
+        )
+        total = float(Q_synth + R_dd + R_stag + R_val)
+        self._record_quality(Q_synth, entropy_mean, energy_signal)
+        self.reward_history.append(total)
+        return total
+
 
 class ScreeningAgent(AgentBase):
+    ACTION_SPACE = {
+        "hit_threshold": (0.5, 0.95),
+        "borderline_exploration": (0.0, 1.0),
+    }
     def __init__(
         self,
         blackboard: QuantumBlackboard,
@@ -3731,6 +4825,7 @@ class ScreeningAgent(AgentBase):
         feature_extractor: Optional[FeatureExtractor] = None,
         active_learning: Optional[ActiveLearningCoordinator] = None,
         ml_api: Optional[MLInferenceAPI] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             "ScreeningAgent",
@@ -3742,21 +4837,40 @@ class ScreeningAgent(AgentBase):
             feature_extractor=feature_extractor,
             active_learning=active_learning,
             ml_api=ml_api,
+            config=config,
         )
         self.quantum_reference = quantum_reference
 
-    async def run(self) -> Dict[str, Any]:
-        ligand_report = await self.blackboard.read("ligands")
+    async def run(
+        self,
+        context_override: Optional[QuantumContext] = None,
+        ligand_report: Optional[Dict[str, Any]] = None,
+        quantum_report: Optional[Dict[str, Any]] = None,
+        synthesis_report: Optional[Dict[str, Any]] = None,
+        action_vector: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        actions = self._prepare_action_vector(action_vector)
+        hit_threshold = float(actions.get("hit_threshold", 0.8))
+        borderline_exploration = float(actions.get("borderline_exploration", 0.5))
+        quantum_payload = quantum_report or await self.blackboard.read("quantum")
+        report_payload = ligand_report or await self.blackboard.read("ProposedLigands")
+        if not report_payload:
+            report_payload = await self.blackboard.read("ligands")
         ligand_id = "lig-novel-001"
         ligand_lambda = None
-        if ligand_report and ligand_report.get("scaffold", {}).get("candidates"):
-            ligand_id = ligand_report["scaffold"]["candidates"][0]["ligandId"]
-            ligand_lambda = ligand_report["scaffold"]["candidates"][0].get("lambdaShellDiagnostics")
-        if ligand_lambda is None and ligand_report and ligand_report.get("inverse", {}).get("candidates"):
-            ligand_lambda = ligand_report["inverse"]["candidates"][0].get("lambdaShellDiagnostics")
+        candidate_pool = (report_payload or {}).get("generatedLigands") or (report_payload or {}).get("finalLigands") or []
+        implausible_set = set((synthesis_report or {}).get("implausibleLigands", []))
+        filtered_candidates = [cand for cand in candidate_pool if cand.get("ligandId") not in implausible_set]
+        working_pool = filtered_candidates or candidate_pool
+        if working_pool:
+            ligand_id = working_pool[0].get("ligandId", ligand_id)
+            ligand_lambda = working_pool[0].get("lambdaShellDiagnostics")
+        if ligand_lambda is None and quantum_payload and quantum_payload.get("best", {}).get("lambdaShellDiagnostics"):
+            ligand_lambda = quantum_payload["best"].get("lambdaShellDiagnostics")
         entropy_values = [sample["entanglementEntropy"] for sample in self.quantum_reference.get("samples", [])]
-        trend = float(np.mean(entropy_values)) if entropy_values else float(self.context.entanglement_entropy)
-        lambda_latent = self.encode_lambda_latent(ligand_lambda or {"descriptors": self.context.lambda_shells})
+        context_in_use = context_override or self.context
+        trend = float(np.mean(entropy_values)) if entropy_values else float(context_in_use.entanglement_entropy)
+        lambda_latent = self.encode_lambda_latent(ligand_lambda or {"descriptors": context_in_use.lambda_shells})
         report = {
             "reportId": f"screen-rep-{ligand_id}",
             "sourceLigandId": ligand_id,
@@ -3771,6 +4885,14 @@ class ScreeningAgent(AgentBase):
             },
             "lambdaLatentTensor": lambda_latent.tolist(),
         }
+        if implausible_set:
+            report["consistencyChecks"] = {"filteredImplausible": sorted(implausible_set)}
+        hits = sorted(report["topHits"], key=lambda hit: hit["matchingScore"], reverse=True)
+        filtered_hits = [hit for hit in hits if hit["matchingScore"] >= hit_threshold]
+        if not filtered_hits:
+            borderline_count = max(1, int(math.ceil(borderline_exploration * len(hits)))) if hits else 0
+            filtered_hits = hits[:borderline_count] if hits else []
+        report["topHits"] = filtered_hits or hits
         if ligand_lambda:
             report["lambdaShellAlignment"] = {
                 "descriptors": ligand_lambda.get("descriptors", []),
@@ -3840,12 +4962,89 @@ class ScreeningAgent(AgentBase):
                         {"ligandId": ligand_id},
                         {"predictions": ml_section["predictions"]},
                     )
+        pretrained_meta: Dict[str, Any] = {}
+        affinity_model = self.ml_models.get("affinity")
+        if affinity_model:
+            pretrained_meta["affinity"] = affinity_model.describe()
+            for hit in report["topHits"]:
+                identifier = f"{ligand_id}:{hit['hitId']}"
+                score = affinity_model.score(identifier)
+                hit["mlAffinityScore"] = float(-4.0 - 4.0 * score)
+        else:
+            if report["topHits"]:
+                self._log_ml_fallback("affinity")
+            for hit in report["topHits"]:
+                identifier = f"{ligand_id}:{hit['hitId']}"
+                score = self._heuristic_model_score("affinity", identifier)
+                hit["mlAffinityScore"] = float(-4.0 - 4.0 * score)
+        if pretrained_meta:
+            report.setdefault("mlAugmentation", {}).setdefault("pretrainedModels", {}).update(pretrained_meta)
         validated = self.validator.validate(self.name, report)
         await self.blackboard.post("screening", validated)
         return validated
 
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        baseline = self._reward_baseline()
+        screen_metric = float(primitives.get("screen_metric", 0.0))
+        binding_energy = float(primitives.get("binding_energy", -8.0))
+        reference_energy = float(primitives.get("reference_energy", -7.0))
+        off_target_energy = float(primitives.get("off_target_energy", binding_energy + 1.0))
+        num_accepted = int(primitives.get("num_accepted", 0))
+        beam_width = int(primitives.get("beam_width", 1))
+        diversity_index = float(primitives.get("diversity_index", 0.0))
+        entropy = primitives.get("entropy_per_shell") or [self.context.entanglement_entropy]
+        leakage = primitives.get("leakage") or [0.0]
+        curvature_gradient = float(primitives.get("curvature_gradient", 0.0))
+        entropy_mean = float(primitives.get("entropy_mean", np.mean(entropy)))
+        energy_signal = screen_metric
+        R_screen = float(np.tanh(screen_metric))
+        R_bind = RewardPrimitives.R_bind(binding_energy, reference_energy)
+        R_select = RewardPrimitives.R_select(binding_energy, off_target_energy)
+        R_accept = RewardPrimitives.R_accept_ligand(num_accepted, max(beam_width, 1))
+        R_div = RewardPrimitives.R_diversity(diversity_index)
+        R_comp = RewardPrimitives.R_compress(
+            bool(primitives.get("is_compressed", False)),
+            float(primitives.get("compression_ratio", 0.0)),
+            bool(primitives.get("basis_mismatch", False)),
+            k_c=0.15,
+            k_b=0.1,
+        )
+        Q_screen = (
+            0.4 * R_screen
+            + 0.2 * R_bind
+            + 0.1 * R_select
+            + 0.2 * R_accept
+            + 0.05 * R_div
+            + 0.05 * R_comp
+        )
+        R_dd = RewardPrimitives.R_dd(Q_screen, baseline["max_quality"], lambda_dd=0.3)
+        R_stag = RewardPrimitives.R_stagnation(
+            Q_screen,
+            baseline["prev_quality"],
+            entropy_mean,
+            baseline["prev_entropy"],
+            energy_signal,
+            baseline["prev_energy"],
+            lambda_stag=0.3,
+        )
+        validator = primitives.get("validatorDiagnostics", {})
+        R_val = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.05,
+            lambda_clamp=0.02,
+        )
+        total = float(Q_screen + R_dd + R_stag + R_val)
+        self._record_quality(Q_screen, entropy_mean, energy_signal)
+        self.reward_history.append(total)
+        return total
+
 
 class SafetyAgent(AgentBase):
+    ACTION_SPACE = {
+        "toxicity_weight": (0.5, 2.0),
+        "uncertainty_tradeoff": (0.0, 1.0),
+    }
     def __init__(
         self,
         blackboard: QuantumBlackboard,
@@ -3857,6 +5056,7 @@ class SafetyAgent(AgentBase):
         feature_extractor: Optional[FeatureExtractor] = None,
         active_learning: Optional[ActiveLearningCoordinator] = None,
         ml_api: Optional[MLInferenceAPI] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             "SafetyAgent",
@@ -3868,6 +5068,7 @@ class SafetyAgent(AgentBase):
             feature_extractor=feature_extractor,
             active_learning=active_learning,
             ml_api=ml_api,
+            config=config,
         )
         self.quantum_reference = quantum_reference
 
@@ -3892,27 +5093,80 @@ class SafetyAgent(AgentBase):
         self.observation_state.setdefault("lambdaSafetyDiagnostics", []).append(record)
         return record
 
-    async def run(self) -> Dict[str, Any]:
-        quantum_report = await self.blackboard.read("quantum")
-        ligand_report = await self.blackboard.read("ligands")
-        ligand_id = quantum_report["sourceLigandId"] if quantum_report else "lig-novel-001"
-        ligand_lambda = None
-        if ligand_report:
-            for bucket in ("scaffold", "inverse"):
-                candidates = ligand_report.get(bucket, {}).get("candidates", [])
-                if candidates and candidates[0].get("lambdaShellDiagnostics"):
-                    ligand_lambda = candidates[0]["lambdaShellDiagnostics"]
-                    break
-        if ligand_lambda is None and quantum_report and quantum_report.get("lambdaShellDiagnostics"):
-            ligand_lambda = quantum_report.get("lambdaShellDiagnostics")
-        lambda_latent = self.encode_lambda_latent(ligand_lambda or {"descriptors": self.context.lambda_shells})
-        anomaly = self.detect_lambda_anomalies(lambda_latent)
+    async def run(
+        self,
+        context_override: Optional[QuantumContext] = None,
+        ligand_report: Optional[Dict[str, Any]] = None,
+        screening_report: Optional[Dict[str, Any]] = None,
+        synthesis_report: Optional[Dict[str, Any]] = None,
+        action_vector: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        actions = self._prepare_action_vector(action_vector)
+        toxicity_weight = float(actions.get("toxicity_weight", 1.0))
+        uncertainty_tradeoff = float(actions.get("uncertainty_tradeoff", 0.5))
+        report_payload = ligand_report or await self.blackboard.read("ProposedLigands")
+        if not report_payload:
+            report_payload = await self.blackboard.read("ligands")
+        candidate_pool = (report_payload or {}).get("generatedLigands") or (report_payload or {}).get("finalLigands") or []
+        context_in_use = context_override or self.context
         entropy_values = [sample["entanglementEntropy"] for sample in self.quantum_reference.get("samples", [])]
         variability = float(np.std(entropy_values)) if entropy_values else 0.1
+        variability *= 1.0 + 0.3 * (uncertainty_tradeoff - 0.5)
+        binding_lookup = {}
+        steps_lookup = {}
+        for route in (synthesis_report or {}).get("perLigandRoutes", []):
+            binding_lookup[route.get("ligandId")] = route.get("bindingFreeEnergy")
+            steps_lookup[route.get("ligandId")] = route.get("syntheticSteps")
+        default_lambda = {"descriptors": context_in_use.lambda_shells}
+        per_assessments: List[Dict[str, Any]] = []
+        for candidate in candidate_pool:
+            ligand_id = candidate.get("ligandId", "lig-novel-001")
+            candidate_lambda = candidate.get("lambdaShellDiagnostics") or default_lambda
+            lambda_latent = self.encode_lambda_latent(candidate_lambda)
+            anomaly = self.detect_lambda_anomalies(lambda_latent)
+            tox_model = self.ml_models.get("toxicity")
+            if tox_model:
+                tox_score = tox_model.score(ligand_id)
+            else:
+                self._log_ml_fallback("toxicity")
+                tox_score = self._heuristic_model_score("toxicity", ligand_id)
+            risk = float(np.clip(0.15 + 0.7 * tox_score * toxicity_weight, 0.0, 1.0))
+            binding_energy = binding_lookup.get(ligand_id)
+            synth_steps = steps_lookup.get(ligand_id, candidate.get("syntheticSteps", 2))
+            skepticism_flag = bool(
+                binding_energy is not None and binding_energy < -10.0 and risk < 0.2 and synth_steps <= 2
+            )
+            per_assessments.append(
+                {
+                    "ligandId": ligand_id,
+                    "toxicityRiskScore": risk,
+                    "lambdaAnomaly": anomaly,
+                    "lambdaLatentTensor": lambda_latent.tolist(),
+                    "bindingFreeEnergy": binding_energy,
+                    "syntheticSteps": synth_steps,
+                    "skepticismFlag": skepticism_flag,
+                }
+            )
+        if not per_assessments:
+            ligand_id = "lig-novel-001"
+            lambda_latent = self.encode_lambda_latent({"descriptors": context_in_use.lambda_shells})
+            anomaly = self.detect_lambda_anomalies(lambda_latent)
+            per_assessments.append(
+                {
+                    "ligandId": ligand_id,
+                    "toxicityRiskScore": 0.35,
+                    "lambdaAnomaly": anomaly,
+                    "lambdaLatentTensor": lambda_latent.tolist(),
+                    "bindingFreeEnergy": None,
+                    "syntheticSteps": 2,
+                    "skepticismFlag": False,
+                }
+            )
+        primary = min(per_assessments, key=lambda entry: entry["toxicityRiskScore"])
         admet_report = {
-            "reportId": f"admet-rep-{ligand_id}",
-            "sourceLigandId": ligand_id,
-            "toxicityRiskScore": float(np.clip(0.18 + 0.05 * random.random(), 0.0, 1.0)),
+            "reportId": f"admet-rep-{primary['ligandId']}",
+            "sourceLigandId": primary["ligandId"],
+            "toxicityRiskScore": primary["toxicityRiskScore"],
             "alerts": ["PAINS"],
             "pharmacokinetics": {"bioavailability": 0.62, "halfLife": 4.0},
             "rationale": "Quantum-informed ensemble PK modeling across population variability.",
@@ -3920,14 +5174,20 @@ class SafetyAgent(AgentBase):
                 "entropyStdDev": variability,
                 "ensembleRuns": 128,
             },
-            "lambdaAnomaly": anomaly,
-            "lambdaLatentTensor": lambda_latent.tolist(),
+            "lambdaAnomaly": primary["lambdaAnomaly"],
+            "lambdaLatentTensor": primary["lambdaLatentTensor"],
         }
-        if ligand_lambda:
-            admet_report["lambdaShellDiagnostics"] = ligand_lambda
+        pretrained_meta: Dict[str, Any] = {}
+        tox_model = self.ml_models.get("toxicity")
+        if tox_model:
+            pretrained_meta["toxicity"] = tox_model.describe()
+        if candidate_pool:
+            admet_report["lambdaShellDiagnostics"] = candidate_pool[0].get(
+                "lambdaShellDiagnostics", default_lambda
+            )
         off_target_report = {
-            "reportId": f"off-target-rep-{ligand_id}",
-            "sourceLigandId": ligand_id,
+            "reportId": f"off-target-rep-{primary['ligandId']}",
+            "sourceLigandId": primary["ligandId"],
             "potentialOffTargets": [
                 {"protein": "Kinase-XYZ", "predictedAffinity": float(-7.4 + 0.2 * random.random())},
                 {"protein": "GPCR-123", "predictedAffinity": float(-6.9 + 0.2 * random.random())},
@@ -3945,7 +5205,7 @@ class SafetyAgent(AgentBase):
         if self.dataset_manager and self.ml_registry:
             task_name = "safety.toxicity"
             lambda_feat = self.feature_extractor.featurize_lambda_shells(
-                (ligand_lambda or {}).get("descriptors", [])
+                (admet_report.get("lambdaShellDiagnostics") or {}).get("descriptors", [])
             ) if self.feature_extractor else np.zeros(7)
             base_vec = np.array(
                 [
@@ -3953,20 +5213,36 @@ class SafetyAgent(AgentBase):
                     admet_report["pharmacokinetics"]["bioavailability"],
                     admet_report["pharmacokinetics"]["halfLife"],
                     variability,
-                    anomaly["klDivergence"],
-                    anomaly["maxShellJump"],
+                    primary["lambdaAnomaly"]["klDivergence"],
+                    primary["lambdaAnomaly"]["maxShellJump"],
                 ],
                 dtype=float,
             )
             feature_vec = self.feature_extractor.combine_features(base_vec, lambda_feat) if self.feature_extractor else base_vec
             if self.feature_extractor:
-                feature_vec = self.feature_extractor.combine_features(feature_vec, lambda_latent.flatten())
+                feature_vec = self.feature_extractor.combine_features(
+                    feature_vec, np.asarray(primary["lambdaLatentTensor"], dtype=float).flatten()
+                )
+            feature_vec = np.asarray(feature_vec, dtype=float).flatten()
+            safety_dim = 32
+            if feature_vec.size < safety_dim:
+                feature_vec = np.pad(feature_vec, (0, safety_dim - feature_vec.size))
+            else:
+                feature_vec = feature_vec[:safety_dim]
+            existing = self.dataset_manager.records.get(task_name, [])
+            for record in existing:
+                vec = np.asarray(record["features"], dtype=float).flatten()
+                if vec.size < safety_dim:
+                    vec = np.pad(vec, (0, safety_dim - vec.size))
+                elif vec.size > safety_dim:
+                    vec = vec[:safety_dim]
+                record["features"] = vec
             label = 1.0 if "PAINS" in admet_report["alerts"] else 0.0
             self.dataset_manager.register_record(
                 task_name,
                 feature_vec,
                 label,
-                {"ligandId": ligand_id, "source": "safety_agent"},
+                {"ligandId": primary["ligandId"], "source": "safety_agent"},
             )
             split = self.dataset_manager.build_split(task_name)
             model = self.ml_registry.get_model(task_name)
@@ -3974,10 +5250,11 @@ class SafetyAgent(AgentBase):
                 model = SimpleClassifier(f"{task_name}-clf", architecture="DeepNNProxy")
                 metrics = model.train(split)
                 self.ml_registry.register_model(task_name, model, metrics, split.metadata)
+                training_lambda = admet_report.get("lambdaShellDiagnostics") or default_lambda
                 training_record = lambda_shell_training_hook(
                     self.name,
                     self.context,
-                    ligand_lambda or {"descriptors": self.context.lambda_shells},
+                    training_lambda,
                 )
                 self.observation_state.setdefault("trainingLogs", []).append(training_record)
             if model:
@@ -4000,22 +5277,75 @@ class SafetyAgent(AgentBase):
                         [feature_vec],
                         probs,
                         uncert,
-                        [{"ligandId": ligand_id}],
+                        [{"ligandId": primary["ligandId"]}],
                     )
                 if self.ml_api:
                     self.ml_api.register_endpoint("safety/toxicity", task_name, model.version)
                     self.ml_api.log_call(
                         "safety/toxicity",
-                        {"ligandId": ligand_id},
+                        {"ligandId": primary["ligandId"]},
                         {"toxicityProbability": ml_section.get("toxicityProbability")},
                     )
-        payload = {"admet": admet_report, "offTarget": off_target_report, "mlAugmentation": ml_section}
+        if pretrained_meta:
+            ml_section.setdefault("pretrainedModels", {}).update(pretrained_meta)
+        payload = {
+            "admet": admet_report,
+            "offTarget": off_target_report,
+            "mlAugmentation": ml_section,
+            "perLigandAssessments": per_assessments,
+        }
+        skepticism_ids = [entry["ligandId"] for entry in per_assessments if entry["skepticismFlag"]]
+        if skepticism_ids:
+            payload["crossChecks"] = {"skepticismFlagged": skepticism_ids}
         validated = self.validator.validate(self.name, payload)
         await self.blackboard.post("admet", validated)
         return validated
 
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        baseline = self._reward_baseline()
+        p_tox = float(primitives.get("toxicity_prob", 0.35))
+        u_tox = float(primitives.get("toxicity_uncertainty", 0.1))
+        screen_metric = float(primitives.get("screen_metric", 0.0))
+        entropy_mean = float(primitives.get("entropy_mean", self.context.entanglement_entropy))
+        energy_signal = float(primitives.get("energy_signal", 1.0 - p_tox))
+        R_safety = RewardPrimitives.R_safety(p_tox, u_tox)
+        R_screen = float(np.tanh(screen_metric))
+        R_comp = RewardPrimitives.R_compress(
+            bool(primitives.get("is_compressed", False)),
+            float(primitives.get("compression_ratio", 0.0)),
+            bool(primitives.get("basis_mismatch", False)),
+            k_c=0.15,
+            k_b=0.1,
+        )
+        Q_safety = 0.6 * R_safety + 0.2 * R_screen + 0.2 * R_comp
+        R_dd = RewardPrimitives.R_dd(Q_safety, baseline["max_quality"], lambda_dd=0.2)
+        R_stag = RewardPrimitives.R_stagnation(
+            Q_safety,
+            baseline["prev_quality"],
+            entropy_mean,
+            baseline["prev_entropy"],
+            energy_signal,
+            baseline["prev_energy"],
+            lambda_stag=0.3,
+        )
+        validator = primitives.get("validatorDiagnostics", {})
+        R_val = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.05,
+            lambda_clamp=0.02,
+        )
+        total = float(Q_safety + R_dd + R_stag + R_val)
+        self._record_quality(Q_safety, entropy_mean, energy_signal)
+        self.reward_history.append(total)
+        return total
+
 
 class IPAgent(AgentBase):
+    ACTION_SPACE = {
+        "novelty_weight": (0.0, 1.0),
+        "prior_art_bias": (0.0, 1.0),
+    }
     def __init__(
         self,
         blackboard: QuantumBlackboard,
@@ -4028,6 +5358,7 @@ class IPAgent(AgentBase):
         feature_extractor: Optional[FeatureExtractor] = None,
         active_learning: Optional[ActiveLearningCoordinator] = None,
         ml_api: Optional[MLInferenceAPI] = None,
+        config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(
             "IPAgent",
@@ -4039,23 +5370,37 @@ class IPAgent(AgentBase):
             feature_extractor=feature_extractor,
             active_learning=active_learning,
             ml_api=ml_api,
+            config=config,
         )
         self.data_client = data_client
         self.query = query
 
-    async def run(self) -> Dict[str, Any]:
-        quantum_report = await self.blackboard.read("quantum")
-        ligand_report = await self.blackboard.read("ligands")
-        ligand_id = quantum_report["sourceLigandId"] if quantum_report else "lig-novel-001"
-        ligand_lambda = None
-        if ligand_report:
-            for bucket in ("scaffold", "inverse"):
-                candidates = ligand_report.get(bucket, {}).get("candidates", [])
-                if candidates and candidates[0].get("lambdaShellDiagnostics"):
-                    ligand_lambda = candidates[0]["lambdaShellDiagnostics"]
-                    break
+    async def run(
+        self,
+        context_override: Optional[QuantumContext] = None,
+        ligand_report: Optional[Dict[str, Any]] = None,
+        screening_report: Optional[Dict[str, Any]] = None,
+        synthesis_report: Optional[Dict[str, Any]] = None,
+        action_vector: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        actions = self._prepare_action_vector(action_vector)
+        novelty_weight = float(actions.get("novelty_weight", 0.5))
+        prior_art_bias = float(actions.get("prior_art_bias", 0.5))
+        report_payload = ligand_report or await self.blackboard.read("ProposedLigands")
+        if not report_payload:
+            report_payload = await self.blackboard.read("ligands")
+        candidate_pool = (report_payload or {}).get("generatedLigands") or (report_payload or {}).get("finalLigands") or []
+        ligand_id = candidate_pool[0].get("ligandId", "lig-novel-001") if candidate_pool else "lig-novel-001"
+        ligand_lambda = candidate_pool[0].get("lambdaShellDiagnostics") if candidate_pool else None
+        context_in_use = context_override or self.context
+        if ligand_lambda is None and screening_report and screening_report.get("lambdaShellAlignment"):
+            ligand_lambda = screening_report["lambdaShellAlignment"]
+        steps_lookup = {route.get("ligandId"): route.get("syntheticSteps") for route in (synthesis_report or {}).get("perLigandRoutes", [])}
+        novelty_lookup = {route.get("ligandId"): route.get("noveltyScore") for route in (synthesis_report or {}).get("perLigandRoutes", [])}
         hits = self.data_client.fetch_patent_hits(self.query)
-        lambda_latent = self.encode_lambda_latent(ligand_lambda or {"descriptors": self.context.lambda_shells})
+        lambda_latent = self.encode_lambda_latent(ligand_lambda or {"descriptors": context_in_use.lambda_shells})
+        synthetic_steps = steps_lookup.get(ligand_id, 2)
+        novelty_score = novelty_lookup.get(ligand_id, 0.6)
         report = {
             "reportId": f"ip-rep-{ligand_id}",
             "sourceLigandId": ligand_id,
@@ -4069,6 +5414,16 @@ class IPAgent(AgentBase):
                 }
             ],
             "lambdaLatentTensor": lambda_latent.tolist(),
+        }
+        novelty_metric = novelty_score * (0.5 + novelty_weight)
+        report["noveltyAssessment"] = "High" if novelty_metric > 0.6 else "Moderate"
+        freedom_score = float(np.clip(1.0 - novelty_metric + 0.3 * prior_art_bias, 0.0, 1.0))
+        report["freedomToOperateRiskScore"] = freedom_score
+        report["freedomToOperateRisk"] = "Elevated" if freedom_score > 0.6 else "Low"
+        report["consistencyChecks"] = {
+            "syntheticSteps": synthetic_steps,
+            "noveltyScore": novelty_score,
+            "noveltyWeight": novelty_weight,
         }
         if ligand_lambda:
             report["lambdaShellDiagnostics"] = ligand_lambda
@@ -4137,9 +5492,73 @@ class IPAgent(AgentBase):
                         {"ligandId": ligand_id},
                         {"noveltyScore": ml_section["noveltyScore"]},
                     )
+        pretrained_meta: Dict[str, Any] = {}
+        affinity_model = self.ml_models.get("affinity")
+        if affinity_model:
+            pretrained_meta["affinity"] = affinity_model.describe()
+            risk_score = affinity_model.score(ligand_id)
+        else:
+            self._log_ml_fallback("affinity")
+            risk_score = self._heuristic_model_score("affinity", ligand_id)
+        report["freedomToOperateRiskScore"] = float(np.clip(1.0 - risk_score, 0.0, 1.0))
+        if synthetic_steps <= 2 and novelty_score > 0.8:
+            report.setdefault("flags", []).append(
+                {
+                    "type": "Skepticism",
+                    "message": "Highly novel ligand with trivial synthesis flagged for IP review",
+                }
+            )
+        if pretrained_meta:
+            report.setdefault("mlAugmentation", {}).setdefault("pretrainedModels", {}).update(pretrained_meta)
         validated = self.validator.validate(self.name, report)
         await self.blackboard.post("ip", validated)
         return validated
+
+    def compute_reward(self, primitives: Dict[str, Any]) -> float:
+        baseline = self._reward_baseline()
+        d_ip = float(primitives.get("ip_distance", 0.5))
+        d0 = float(primitives.get("ip_scale", 0.3))
+        binding_energy = float(primitives.get("binding_energy", -8.0))
+        reference_energy = float(primitives.get("reference_energy", -7.0))
+        p_tox = float(primitives.get("toxicity_prob", 0.3))
+        u_tox = float(primitives.get("toxicity_uncertainty", 0.1))
+        yield_estimate = float(primitives.get("yield_estimate", 0.6))
+        complexity = float(primitives.get("complexity", 0.5))
+        entropy_mean = float(primitives.get("entropy_mean", self.context.entanglement_entropy))
+        energy_signal = float(primitives.get("energy_signal", d_ip))
+        R_ip = RewardPrimitives.R_IP(d_ip, max(d0, 1e-3))
+        R_bind = RewardPrimitives.R_bind(binding_energy, reference_energy)
+        R_safety = RewardPrimitives.R_safety(p_tox, u_tox)
+        R_synth = RewardPrimitives.R_synth(yield_estimate, complexity)
+        R_comp = RewardPrimitives.R_compress(
+            bool(primitives.get("is_compressed", False)),
+            float(primitives.get("compression_ratio", 0.0)),
+            bool(primitives.get("basis_mismatch", False)),
+            k_c=0.2,
+            k_b=0.1,
+        )
+        Q_ip = 0.5 * R_ip + 0.15 * R_bind + 0.15 * R_safety + 0.10 * R_synth + 0.10 * R_comp
+        R_dd = RewardPrimitives.R_dd(Q_ip, baseline["max_quality"], lambda_dd=0.2)
+        R_stag = RewardPrimitives.R_stagnation(
+            Q_ip,
+            baseline["prev_quality"],
+            entropy_mean,
+            baseline["prev_entropy"],
+            energy_signal,
+            baseline["prev_energy"],
+            lambda_stag=0.3,
+        )
+        validator = primitives.get("validatorDiagnostics", {})
+        R_val = RewardPrimitives.R_validator(
+            int(validator.get("adjustmentCount", 0)),
+            float(validator.get("meanClampDistance", 0.0)),
+            lambda_adj=0.05,
+            lambda_clamp=0.02,
+        )
+        total = float(Q_ip + R_dd + R_stag + R_val)
+        self._record_quality(Q_ip, entropy_mean, energy_signal)
+        self.reward_history.append(total)
+        return total
 
 
 class JobStatusAgent(AgentBase):
@@ -4166,23 +5585,38 @@ class JobStatusAgent(AgentBase):
             ml_api=ml_api,
         )
 
-    async def run(self) -> Dict[str, Any]:
+    async def run(
+        self,
+        context_override: Optional[QuantumContext] = None,
+        ligand_report: Optional[Dict[str, Any]] = None,
+        quantum_report: Optional[Dict[str, Any]] = None,
+        synthesis_report: Optional[Dict[str, Any]] = None,
+        screening_report: Optional[Dict[str, Any]] = None,
+        safety_report: Optional[Dict[str, Any]] = None,
+        ip_report: Optional[Dict[str, Any]] = None,
+        action_vector: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        context_in_use = context_override or self.context
         report = {
             "jobId": "qm-sim-job-1",
             "status": "COMPLETED",
             "resourceUtilization": {
                 "simulationTime": "1800s",
                 "quantumCircuitFidelity": float(np.clip(0.998 + 0.001 * random.random(), 0.0, 1.0)),
-                "lambdaEnhancement": self.context.enhancement_factor,
+                "lambdaEnhancement": context_in_use.enhancement_factor,
             },
             "retrainMetrics": {
                 "datasetsConsumed": 3,
                 "lastRetrain": "scheduled",
             },
             "lambdaScaling": {
-                "basis": self.context.lambda_basis,
-                "shellDescriptors": self.context.lambda_shells,
+                "basis": context_in_use.lambda_basis,
+                "shellDescriptors": context_in_use.lambda_shells,
             },
+        }
+        report["generationSummary"] = {
+            "ligandCount": len((ligand_report or {}).get("generatedLigands", [])),
+            "implausible": len((synthesis_report or {}).get("implausibleLigands", [])),
         }
         if self.dataset_manager and self.ml_registry:
             task_name = "operations.runtime"
@@ -4192,7 +5626,7 @@ class JobStatusAgent(AgentBase):
                     simulation_seconds,
                     report["resourceUtilization"]["quantumCircuitFidelity"],
                     report["resourceUtilization"]["lambdaEnhancement"],
-                    self.context.entanglement_entropy,
+                    context_in_use.entanglement_entropy,
                 ],
                 dtype=float,
             )
@@ -4300,6 +5734,23 @@ class DrugDiscoverySimulation:
         self.ml_registry = MLModelRegistry()
         self.active_learning = ActiveLearningCoordinator()
         self.ml_api = MLInferenceAPI()
+        shared_model_cfg = {
+            "affinityModelPath": os.getenv("DDS_AFFINITY_MODEL_PATH"),
+            "toxModelPath": os.getenv("DDS_TOX_MODEL_PATH"),
+            "synthModelPath": os.getenv("DDS_SYNTH_MODEL_PATH"),
+        }
+        self.agent_model_configs = {
+            "LigandDiscoveryAgent": dict(shared_model_cfg),
+            "ScreeningAgent": dict(shared_model_cfg),
+            "SafetyAgent": dict(shared_model_cfg),
+            "SynthesisPlannerAgent": dict(shared_model_cfg),
+            "IPAgent": dict(shared_model_cfg),
+        }
+        self.quantum_agent_config = {
+            "alpha_calibration": 0.3,
+            "enable_pm6": True,
+            "mmff_pre_screen_threshold": -3.0,
+        }
         self.validation_engine = StatisticalValidationEngine(random_seed=self.random_seed)
         self.explainability = ExplainabilityEngine(random_seed=self.random_seed)
         self.baseline_suite = BaselineModelSuite(
@@ -4325,6 +5776,11 @@ class DrugDiscoverySimulation:
             memory_api=self.memory_api,
         )
         self._bootstrap_ml_datasets()
+        self.quantum_reports_buffer: List[Dict[str, Any]] = []
+        self.agent_action_history: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self.per_agent_rewards: Dict[str, List[float]] = defaultdict(list)
+        self._lambda_flow_cache: Dict[str, Dict[str, Any]] = {}
+        self.gnn_pretrainer: Optional[QuantumPretrainer] = None
         self.orchestration_directives = {
             "physicalRealism": "Enhance physical realism and chemical accuracy using quantum chemistry and ensemble modeling",
             "additionalFunctions": "Extend agents to ligand library generation, combinatorial synthesis, pharmacophore mining, IP audits",
@@ -4558,6 +6014,7 @@ class DrugDiscoverySimulation:
                 feature_extractor=self.feature_extractor,
                 active_learning=self.active_learning,
                 ml_api=self.ml_api,
+                config=self.agent_model_configs.get("LigandDiscoveryAgent"),
             ),
             QuantumSimulationAgent(
                 self.blackboard,
@@ -4570,6 +6027,7 @@ class DrugDiscoverySimulation:
                 feature_extractor=self.feature_extractor,
                 active_learning=self.active_learning,
                 ml_api=self.ml_api,
+                quantum_config=self.quantum_agent_config,
             ),
             SynthesisPlannerAgent(
                 self.blackboard,
@@ -4581,6 +6039,7 @@ class DrugDiscoverySimulation:
                 feature_extractor=self.feature_extractor,
                 active_learning=self.active_learning,
                 ml_api=self.ml_api,
+                config=self.agent_model_configs.get("SynthesisPlannerAgent"),
             ),
             ScreeningAgent(
                 self.blackboard,
@@ -4592,6 +6051,7 @@ class DrugDiscoverySimulation:
                 feature_extractor=self.feature_extractor,
                 active_learning=self.active_learning,
                 ml_api=self.ml_api,
+                config=self.agent_model_configs.get("ScreeningAgent"),
             ),
             SafetyAgent(
                 self.blackboard,
@@ -4603,6 +6063,7 @@ class DrugDiscoverySimulation:
                 feature_extractor=self.feature_extractor,
                 active_learning=self.active_learning,
                 ml_api=self.ml_api,
+                config=self.agent_model_configs.get("SafetyAgent"),
             ),
             IPAgent(
                 self.blackboard,
@@ -4615,6 +6076,7 @@ class DrugDiscoverySimulation:
                 feature_extractor=self.feature_extractor,
                 active_learning=self.active_learning,
                 ml_api=self.ml_api,
+                config=self.agent_model_configs.get("IPAgent"),
             ),
             JobStatusAgent(
                 self.blackboard,
@@ -4630,7 +6092,514 @@ class DrugDiscoverySimulation:
         for agent in agents:
             self.core_ai.register_agent(agent.name, agent)
             self.gtai_adapter.register_agent(agent)
+        (
+            self.structural_agent,
+            self.ligand_agent,
+            self.quantum_agent,
+            self.synth_agent,
+            self.screen_agent,
+            self.safety_agent,
+            self.ip_agent,
+            self.status_agent,
+        ) = agents
+        if self.gnn_pretrainer is None:
+            self.gnn_pretrainer = QuantumPretrainer(
+                self.ligand_agent.surrogate_model,
+                context_provider=lambda: self.context,
+            )
         return agents
+
+    def _initial_seed_ligands(self) -> List[Dict[str, Any]]:
+        base_scaffolds = [f"{self.target_query}-seed-{idx}" for idx in range(3)] + ["lig-novel-001"]
+        seeds: List[Dict[str, Any]] = []
+        for idx, scaffold in enumerate(base_scaffolds):
+            seeds.append(
+                {
+                    "ligandId": scaffold,
+                    "smiles": scaffold,
+                    "noveltyScore": float(0.35 + 0.1 * idx),
+                    "syntheticSteps": 2,
+                }
+            )
+        return seeds
+
+    def _tanimoto_like_similarity(self, smiles_a: str, smiles_b: str) -> float:
+        set_a = set(smiles_a)
+        set_b = set(smiles_b)
+        union = len(set_a | set_b) or 1
+        return float(len(set_a & set_b) / union)
+
+    def _select_next_generation_seeds(
+        self,
+        ligand_report: Optional[Dict[str, Any]],
+        screening_report: Optional[Dict[str, Any]],
+        safety_report: Optional[Dict[str, Any]],
+        ip_report: Optional[Dict[str, Any]],
+        beam_width: int,
+    ) -> List[Dict[str, Any]]:
+        candidate_pool = (ligand_report or {}).get("generatedLigands") or []
+        if not candidate_pool:
+            return self._initial_seed_ligands()
+        disqualified = set((screening_report or {}).get("consistencyChecks", {}).get("filteredImplausible", []))
+        safety_lookup = {
+            entry.get("ligandId"): entry.get("toxicityRiskScore", 0.4)
+            for entry in (safety_report or {}).get("perLigandAssessments", [])
+        }
+        ip_penalty = set()
+        for flag in (ip_report or {}).get("flags", []) or []:
+            if isinstance(flag, dict) and flag.get("type") == "Skepticism":
+                ip_penalty.add(ip_report.get("sourceLigandId"))
+        scored: List[Tuple[Dict[str, Any], float]] = []
+        for candidate in candidate_pool:
+            ligand_id = candidate.get("ligandId")
+            if ligand_id in disqualified:
+                continue
+            base_score = float(candidate.get("inverseDesignScore", 0.0))
+            novelty = float(candidate.get("noveltyScore", 0.5))
+            toxicity_penalty = safety_lookup.get(ligand_id, 0.3)
+            composite = base_score + 0.25 * novelty - 0.35 * toxicity_penalty
+            if ligand_id in ip_penalty:
+                composite -= 0.15
+            scored.append((candidate, composite))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        selected: List[Dict[str, Any]] = []
+        for candidate, _ in scored:
+            smiles = candidate.get("smiles", "")
+            if any(self._tanimoto_like_similarity(smiles, prev.get("smiles", "")) > 0.85 for prev in selected):
+                continue
+            selected.append(copy.deepcopy(candidate))
+            if len(selected) >= beam_width:
+                break
+        if not selected:
+            selected = [copy.deepcopy(candidate) for candidate, _ in scored[:beam_width]]
+        return selected[:beam_width] if selected else self._initial_seed_ligands()
+
+    def _compute_action_vector(self, agent: AgentBase, generation: int) -> Dict[str, float]:
+        action_space = getattr(agent, "ACTION_SPACE", None)
+        if not action_space:
+            return {}
+        actions: Dict[str, float] = {}
+        for idx, (key, bounds) in enumerate(action_space.items()):
+            low, high = bounds
+            normalized = 0.5 + 0.25 * math.sin(generation + idx * 0.5)
+            normalized = min(max(normalized, 0.0), 1.0)
+            actions[key] = float(low + (high - low) * normalized)
+        return actions
+
+    def _extract_lambda_descriptors(self, report: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not report:
+            return list(self.context.lambda_shells)
+        if report.get("lambdaShellDiagnostics"):
+            diag = report["lambdaShellDiagnostics"]
+            if isinstance(diag, dict) and diag.get("descriptors"):
+                return list(diag.get("descriptors", []))
+        if report.get("quantumPocketInsights"):
+            analysis = report["quantumPocketInsights"].get("lambdaShellAnalysis")
+            if analysis and analysis.get("descriptors"):
+                return list(analysis.get("descriptors", []))
+        if report.get("lambdaShellEmbedding"):
+            descriptors = report["lambdaShellEmbedding"].get("descriptors")
+            if descriptors:
+                return list(descriptors)
+        candidates = report.get("pockets") or report.get("generatedLigands") or report.get("finalLigands") or []
+        if candidates:
+            diag = candidates[0].get("lambdaShellDiagnostics")
+            if diag and diag.get("descriptors"):
+                return list(diag.get("descriptors", []))
+        if report.get("best") and isinstance(report["best"], dict):
+            diag = report["best"].get("lambdaShellDiagnostics")
+            if diag and diag.get("descriptors"):
+                return list(diag.get("descriptors", []))
+        return list(self.context.lambda_shells)
+
+    def _lambda_reward_inputs(self, agent_name: str, report: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        descriptors = self._extract_lambda_descriptors(report)
+        entropy = [float(entry.get("lambdaEntropy", self.context.entanglement_entropy)) for entry in descriptors]
+        occupancy = [float(entry.get("lambdaOccupancy", 0.0)) for entry in descriptors]
+        leakage = [float(entry.get("lambdaLeakage", 0.0)) for entry in descriptors]
+        curvature = [float(entry.get("lambdaCurvature", 0.0)) for entry in descriptors]
+        bhattacharyya = [float(entry.get("lambdaBhattacharyya", 0.0)) for entry in descriptors]
+        entropy_mean = float(np.mean(entropy)) if entropy else self.context.entanglement_entropy
+        curvature_gradient = float(curvature[-1] - curvature[0]) if len(curvature) > 1 else (curvature[0] if curvature else 0.0)
+        flux = float(np.std(bhattacharyya)) if bhattacharyya else 0.0
+        gradient = float(entropy[-1] - entropy[0]) if len(entropy) > 1 else 0.0
+        prev_state = self._lambda_flow_cache.get(agent_name, {})
+        prev_occ = prev_state.get("occupancy")
+        if prev_occ is None:
+            prev_occ = np.zeros(len(occupancy), dtype=float)
+        else:
+            prev_occ = np.asarray(prev_occ, dtype=float)
+        curr_occ = np.asarray(occupancy, dtype=float)
+        shell_delta = float(entropy_mean - prev_state.get("entropy_mean", entropy_mean))
+        self._lambda_flow_cache[agent_name] = {"occupancy": curr_occ, "entropy_mean": entropy_mean}
+        return {
+            "entropy": entropy,
+            "occupancy": curr_occ,
+            "occupancy_prev": prev_occ,
+            "leakage": leakage,
+            "curvature_gradient": curvature_gradient,
+            "entropy_mean": entropy_mean,
+            "entropy_gradient": gradient,
+            "flux": flux,
+            "shell_entropy_delta": shell_delta,
+            "attractor": float(np.mean(bhattacharyya)) if bhattacharyya else 0.0,
+        }
+
+    def _build_reward_primitives(
+        self,
+        agent_name: str,
+        report: Optional[Dict[str, Any]],
+        **overrides: Any,
+    ) -> Dict[str, Any]:
+        lambda_inputs = self._lambda_reward_inputs(agent_name, report)
+        primitives: Dict[str, Any] = {
+            "entropy_per_shell": lambda_inputs["entropy"],
+            "curvature_gradient": lambda_inputs["curvature_gradient"],
+            "leakage": lambda_inputs["leakage"],
+            "occupancy": lambda_inputs["occupancy"],
+            "occupancy_prev": lambda_inputs["occupancy_prev"],
+            "shellEntropyDelta": lambda_inputs["shell_entropy_delta"],
+            "entropy_mean": lambda_inputs["entropy_mean"],
+            "lambdaAttractorScore": lambda_inputs["attractor"],
+            "lambdaEntropyGradient": lambda_inputs["entropy_gradient"],
+            "lambdaBhattacharyyaFlux": lambda_inputs["flux"],
+            "validatorDiagnostics": (report or {}).get("validatorDiagnostics", {}),
+        }
+        primitives.update(overrides)
+        return primitives
+
+    def _append_agent_reward(
+        self,
+        agent: AgentBase,
+        report: Optional[Dict[str, Any]],
+        primitives: Dict[str, Any],
+    ) -> float:
+        reward = float(agent.compute_reward(primitives))
+        self.per_agent_rewards[agent.name].append(reward)
+        if isinstance(report, dict):
+            report.setdefault("rewardSignal", reward)
+        return reward
+
+    def _diversity_index(self, entries: Sequence[Dict[str, Any]], key: str = "smiles") -> float:
+        if not entries:
+            return 0.0
+        values = []
+        for entry in entries:
+            value = entry.get(key) or entry.get("ligandId") or entry.get("hitId")
+            if value:
+                values.append(value)
+        unique = len(set(values))
+        return float(unique / max(len(entries), 1))
+
+    def compute_episode_reward(self, lambda_risk: float = 0.3) -> float:
+        trajectory: List[float] = []
+        for rewards in self.per_agent_rewards.values():
+            trajectory.extend(rewards)
+        if not trajectory:
+            return 0.0
+        arr = np.asarray(trajectory, dtype=float)
+        mean_q = float(arr.mean())
+        std_q = float(arr.std())
+        return float(mean_q - lambda_risk * std_q)
+
+    async def _run_agent_with_logging(
+        self, agent: AgentBase, *args: Any, action_vector: Optional[Dict[str, float]] = None
+    ) -> Dict[str, Any]:
+        self.gtai_adapter.before_agent_run(agent.name)
+        before_snapshot = self.context.to_snapshot()
+        blackboard_before = list(self.blackboard.posts.keys())
+        if action_vector is None and getattr(agent, "ACTION_SPACE", None):
+            action_vector = {}
+        if action_vector:
+            logger.info("%s action vector: %s", agent.name, action_vector)
+        result = await agent.run(*args, action_vector=action_vector)
+        processed, integration_meta = self.gtai_adapter.after_agent_report(agent.name, result)
+        if integration_meta:
+            processed["gtaiIntegration"] = integration_meta
+        self._record_agent_step(agent.name, processed, before_snapshot, blackboard_before)
+        if action_vector is not None:
+            processed.setdefault("actionVector", action_vector)
+            self.agent_action_history[agent.name].append(
+                {
+                    "generation": getattr(self, "_current_generation", -1),
+                    "action": action_vector,
+                    "timestamp": time.time(),
+                }
+            )
+        return processed
+
+    async def run_full_cycle(self, generations: int = 10, beam_width: int = 16) -> Dict[str, Any]:
+        seed_ligands = self._initial_seed_ligands()
+        latest_reports: Dict[str, Any] = {}
+        generation_logs: List[Dict[str, Any]] = []
+        reference_energy = float(self.quantum_reference.get("statistics", {}).get("meanEnergy", -8.0))
+        for gen_idx in range(generations):
+            self._current_generation = gen_idx
+            action_snapshot: Dict[str, Dict[str, float]] = {}
+            structural_actions = self._compute_action_vector(self.structural_agent, gen_idx)
+            action_snapshot[self.structural_agent.name] = structural_actions
+            structural_report = await self._run_agent_with_logging(
+                self.structural_agent,
+                action_vector=structural_actions,
+            )
+            latest_reports["StructuralAnalysisAgent"] = structural_report
+            latest_reports["structural"] = structural_report
+            struct_desc = self._extract_lambda_descriptors(structural_report)
+            struct_ratio = float(len(struct_desc) / max(len(self.context.lambda_shells) or 1, 1))
+            struct_basis = (
+                structural_report.get("quantumPocketInsights", {})
+                .get("summary", {})
+                .get("scalingBasis")
+            )
+            struct_primitives = self._build_reward_primitives(
+                self.structural_agent.name,
+                structural_report,
+                energy_signal=float(self.context.enhancement_factor),
+                is_compressed=bool(structural_report.get("quantumPocketInsights")),
+                compression_ratio=struct_ratio,
+                basis_mismatch=bool(struct_basis and str(struct_basis).lower() != "lambda"),
+            )
+            self._append_agent_reward(self.structural_agent, structural_report, struct_primitives)
+
+            ligand_actions = self._compute_action_vector(self.ligand_agent, gen_idx)
+            action_snapshot[self.ligand_agent.name] = ligand_actions
+            ligand_report = await self._run_agent_with_logging(
+                self.ligand_agent,
+                self.context,
+                seed_ligands,
+                beam_width,
+                action_vector=ligand_actions,
+            )
+            latest_reports["LigandDiscoveryAgent"] = ligand_report
+            ligand_candidates = ligand_report.get("generatedLigands", [])
+            if ligand_candidates:
+                binding_candidate = min(
+                    ligand_candidates,
+                    key=lambda cand: float(
+                        cand.get("mlAffinityScore")
+                        or cand.get("metrics", {}).get("referenceEnergyMean", reference_energy)
+                    ),
+                )
+            else:
+                binding_candidate = {}
+            binding_estimate = float(
+                binding_candidate.get("mlAffinityScore")
+                or binding_candidate.get("metrics", {}).get("referenceEnergyMean", reference_energy)
+                or reference_energy
+            )
+            risk_predictions = (
+                ligand_report.get("mlAugmentation", {})
+                .get("riskPredictions", [])
+            )
+            if risk_predictions:
+                toxicity_prob = float(np.mean([pred.get("riskScore", 0.3) for pred in risk_predictions]))
+                toxicity_unc = float(np.mean([pred.get("uncertainty", 0.1) for pred in risk_predictions]))
+            else:
+                toxicity_prob, toxicity_unc = 0.3, 0.1
+            novelty_value = float(binding_candidate.get("noveltyScore", 0.5))
+            stats_payload = ligand_report.get("stats", {})
+            num_accepted = int(stats_payload.get("acceptedCount", len(ligand_candidates)))
+            ligand_primitives = self._build_reward_primitives(
+                self.ligand_agent.name,
+                ligand_report,
+                binding_energy=binding_estimate,
+                reference_energy=reference_energy,
+                off_target_energy=binding_estimate + 1.0,
+                toxicity_prob=toxicity_prob,
+                toxicity_uncertainty=toxicity_unc,
+                ip_distance=novelty_value,
+                ip_scale=0.4,
+                num_accepted=num_accepted,
+                beam_width=beam_width,
+                diversity_index=self._diversity_index(ligand_candidates),
+                is_compressed=bool(ligand_report.get("mlAugmentation")),
+                compression_ratio=float(len(ligand_candidates)) / max(beam_width, 1),
+                energy_signal=binding_estimate,
+            )
+            self._append_agent_reward(self.ligand_agent, ligand_report, ligand_primitives)
+
+            quantum_actions = self._compute_action_vector(self.quantum_agent, gen_idx)
+            action_snapshot[self.quantum_agent.name] = quantum_actions
+            quantum_report = await self._run_agent_with_logging(
+                self.quantum_agent,
+                self.context,
+                ligand_report,
+                action_vector=quantum_actions,
+            )
+            best_quantum = quantum_report.get("best") or {}
+            latest_reports["QuantumSimulationAgent"] = best_quantum
+            self.quantum_reports_buffer.extend(quantum_report.get("perLigand", []))
+            pipeline = best_quantum.get("hybridEnergyPipeline", {})
+            quantum_primitives = self._build_reward_primitives(
+                self.quantum_agent.name,
+                best_quantum,
+                binding_energy=float(best_quantum.get("bindingFreeEnergy", reference_energy)),
+                reference_energy=reference_energy,
+                mmff_energy=float(pipeline.get("mmffEnergy", best_quantum.get("bindingFreeEnergy", reference_energy))),
+                lambda_correction=float(pipeline.get("lambdaCorrection", 0.0)),
+                is_compressed=bool(pipeline),
+                compression_ratio=float(len(quantum_report.get("perLigand", []))) / max(beam_width, 1),
+                energy_signal=float(best_quantum.get("bindingFreeEnergy", reference_energy)),
+            )
+            self._append_agent_reward(self.quantum_agent, best_quantum, quantum_primitives)
+
+            synthesis_actions = self._compute_action_vector(self.synth_agent, gen_idx)
+            action_snapshot[self.synth_agent.name] = synthesis_actions
+            synthesis_report = await self._run_agent_with_logging(
+                self.synth_agent,
+                self.context,
+                ligand_report,
+                quantum_report,
+                action_vector=synthesis_actions,
+            )
+            latest_reports["SynthesisPlannerAgent"] = synthesis_report
+            success_prob = float(
+                synthesis_report.get("mlAugmentation", {})
+                .get("successProbability", 0.6)
+            )
+            complexity_score = float(
+                synthesis_report.get("feasibilityAssessment", {})
+                .get("syntheticAccessibility", 5.0)
+            ) / 10.0
+            synth_primitives = self._build_reward_primitives(
+                self.synth_agent.name,
+                synthesis_report,
+                yield_estimate=success_prob,
+                complexity=complexity_score,
+                toxicity_prob=toxicity_prob,
+                toxicity_uncertainty=toxicity_unc,
+                is_compressed=bool(synthesis_report.get("mlAugmentation")),
+                compression_ratio=float(len(synthesis_report.get("perLigandRoutes", [])) or 0) / max(len(ligand_candidates) or 1, 1),
+                energy_signal=1.0 - complexity_score,
+            )
+            self._append_agent_reward(self.synth_agent, synthesis_report, synth_primitives)
+
+            screening_actions = self._compute_action_vector(self.screen_agent, gen_idx)
+            action_snapshot[self.screen_agent.name] = screening_actions
+            screening_report = await self._run_agent_with_logging(
+                self.screen_agent,
+                self.context,
+                ligand_report,
+                quantum_report,
+                synthesis_report,
+                action_vector=screening_actions,
+            )
+            latest_reports["ScreeningAgent"] = screening_report
+            hit_scores = [hit.get("matchingScore", 0.0) for hit in screening_report.get("topHits", [])]
+            screen_metric = float(np.mean(hit_scores)) if hit_scores else 0.0
+            screening_primitives = self._build_reward_primitives(
+                self.screen_agent.name,
+                screening_report,
+                binding_energy=float(best_quantum.get("bindingFreeEnergy", reference_energy)),
+                reference_energy=reference_energy,
+                off_target_energy=float(best_quantum.get("bindingFreeEnergy", reference_energy)) + 1.0,
+                screen_metric=screen_metric,
+                num_accepted=len(screening_report.get("topHits", [])),
+                beam_width=max(beam_width, 1),
+                diversity_index=self._diversity_index(screening_report.get("topHits", []), key="hitId"),
+                is_compressed=bool(screening_report.get("mlAugmentation")),
+                compression_ratio=float(len(screening_report.get("topHits", []))) / max(beam_width, 1),
+                energy_signal=screen_metric,
+            )
+            self._append_agent_reward(self.screen_agent, screening_report, screening_primitives)
+
+            safety_actions = self._compute_action_vector(self.safety_agent, gen_idx)
+            action_snapshot[self.safety_agent.name] = safety_actions
+            safety_report = await self._run_agent_with_logging(
+                self.safety_agent,
+                self.context,
+                ligand_report,
+                screening_report,
+                synthesis_report,
+                action_vector=safety_actions,
+            )
+            latest_reports["SafetyAgent"] = safety_report
+            admet = safety_report.get("admet", {})
+            safety_primitives = self._build_reward_primitives(
+                self.safety_agent.name,
+                safety_report,
+                toxicity_prob=float(admet.get("toxicityRiskScore", 0.35)),
+                toxicity_uncertainty=float(safety_report.get("mlAugmentation", {}).get("uncertainty", 0.1)),
+                screen_metric=screen_metric,
+                is_compressed=bool(safety_report.get("mlAugmentation")),
+                compression_ratio=1.0,
+                energy_signal=1.0 - float(admet.get("toxicityRiskScore", 0.35)),
+            )
+            self._append_agent_reward(self.safety_agent, safety_report, safety_primitives)
+
+            ip_actions = self._compute_action_vector(self.ip_agent, gen_idx)
+            action_snapshot[self.ip_agent.name] = ip_actions
+            ip_report = await self._run_agent_with_logging(
+                self.ip_agent,
+                self.context,
+                ligand_report,
+                screening_report,
+                synthesis_report,
+                action_vector=ip_actions,
+            )
+            latest_reports["IPAgent"] = ip_report
+            ip_primitives = self._build_reward_primitives(
+                self.ip_agent.name,
+                ip_report,
+                ip_distance=float(ip_report.get("mlAugmentation", {}).get("noveltyScore", novelty_value)),
+                ip_scale=0.4,
+                binding_energy=float(best_quantum.get("bindingFreeEnergy", reference_energy)),
+                reference_energy=reference_energy,
+                toxicity_prob=float(admet.get("toxicityRiskScore", 0.35)),
+                toxicity_uncertainty=float(safety_report.get("mlAugmentation", {}).get("uncertainty", 0.1)),
+                yield_estimate=success_prob,
+                complexity=complexity_score,
+                is_compressed=bool(ip_report.get("mlAugmentation")),
+                compression_ratio=1.0,
+                energy_signal=float(ip_report.get("mlAugmentation", {}).get("noveltyScore", novelty_value)),
+            )
+            self._append_agent_reward(self.ip_agent, ip_report, ip_primitives)
+
+            status_actions = self._compute_action_vector(self.status_agent, gen_idx)
+            action_snapshot[self.status_agent.name] = status_actions
+            status_report = await self._run_agent_with_logging(
+                self.status_agent,
+                self.context,
+                ligand_report,
+                quantum_report,
+                synthesis_report,
+                screening_report,
+                safety_report,
+                ip_report,
+                action_vector=status_actions,
+            )
+            latest_reports["JobStatusAgent"] = status_report
+            generation_logs.append(
+                {
+                    "generation": gen_idx,
+                    "acceptedLigands": len(ligand_candidates),
+                    "bestBindingEnergy": float(best_quantum.get("bindingFreeEnergy", reference_energy)),
+                    "actionVectors": action_snapshot,
+                }
+            )
+            seed_ligands = self._select_next_generation_seeds(
+                ligand_report,
+                screening_report,
+                safety_report,
+                ip_report,
+                beam_width,
+            )
+        return {
+            "reports": latest_reports,
+            "finalLigands": seed_ligands,
+            "status": latest_reports.get("JobStatusAgent"),
+            "generations": generation_logs,
+        }
+
+    def post_episode_training(self) -> None:
+        if not self.gnn_pretrainer:
+            return
+        dataset = self.gnn_pretrainer.load_dataset(self.quantum_reports_buffer)
+        if dataset:
+            updated_model = self.gnn_pretrainer.train(dataset)
+            if self.ligand_agent.inverse_engine:
+                self.ligand_agent.inverse_engine.surrogate_model.load_state_dict(updated_model.state_dict())
+        self.quantum_reports_buffer.clear()
 
     def _sanitize_for_json(self, value: Any) -> Any:
         if isinstance(value, (str, int, float, bool)) or value is None:
@@ -4767,7 +6736,15 @@ class DrugDiscoverySimulation:
         self.agent_traces: List[Dict[str, Any]] = []
         self.agent_trace_path = output_dir / "agent_trace.log"
         self.agent_trace_path.write_text("")
+        self.per_agent_rewards = defaultdict(list)
+        self._lambda_flow_cache = {}
         agents = await self._instantiate_agents()
+        for agent in agents:
+            agent.reward_history.clear()
+            agent.quality_history.clear()
+            agent.max_quality = float("-inf")
+            agent.last_entropy_signal = 0.0
+            agent.last_energy_signal = 0.0
         reports: Dict[str, Any] = {}
         await self.blackboard.post(
             "quantumTrainingData",
@@ -4791,45 +6768,16 @@ class DrugDiscoverySimulation:
             "mlStatus",
             self.validator.validate("MLOrchestrator", ml_status_payload),
         )
-        # run structural first to seed pockets
-        self.gtai_adapter.before_agent_run(agents[0].name)
-        structural_before_snapshot = self.context.to_snapshot()
-        structural_blackboard_before = list(self.blackboard.posts.keys())
-        structural_report = await agents[0].run()
-        structural_report, structural_meta = self.gtai_adapter.after_agent_report(
-            agents[0].name, structural_report
-        )
-        if structural_meta:
-            structural_report["gtaiIntegration"] = structural_meta
-        reports["structural"] = structural_report
-        self._record_agent_step(
-            agents[0].name,
-            structural_report,
-            structural_before_snapshot,
-            structural_blackboard_before,
-        )
-        # run discovery + quantum sequentially to respect dependencies
-        for agent in agents[1:3]:
-            self.gtai_adapter.before_agent_run(agent.name)
-            before_snapshot = self.context.to_snapshot()
-            blackboard_before = list(self.blackboard.posts.keys())
-            agent_report = await agent.run()
-            processed, integration_meta = self.gtai_adapter.after_agent_report(agent.name, agent_report)
-            if integration_meta:
-                processed["gtaiIntegration"] = integration_meta
-            reports[agent.name] = processed
-            self._record_agent_step(agent.name, processed, before_snapshot, blackboard_before)
-        # run remaining agents sequentially for detailed logging
-        for agent in agents[3:]:
-            self.gtai_adapter.before_agent_run(agent.name)
-            before_snapshot = self.context.to_snapshot()
-            blackboard_before = list(self.blackboard.posts.keys())
-            agent_report = await agent.run()
-            processed, integration_meta = self.gtai_adapter.after_agent_report(agent.name, agent_report)
-            if integration_meta:
-                processed["gtaiIntegration"] = integration_meta
-            reports[agent.name] = processed
-            self._record_agent_step(agent.name, processed, before_snapshot, blackboard_before)
+        cycle_result = await self.run_full_cycle()
+        reports.update(cycle_result.get("reports", {}))
+        if cycle_result.get("reports") and cycle_result["reports"].get("structural"):
+            reports["structural"] = cycle_result["reports"].get("structural")
+        reports["finalLigands"] = cycle_result.get("finalLigands")
+        reports["generationSummaries"] = cycle_result.get("generations")
+        reports["status"] = cycle_result.get("status")
+        reports["perAgentRewards"] = {name: values for name, values in self.per_agent_rewards.items()}
+        reports["episodeReward"] = self.compute_episode_reward()
+        self.post_episode_training()
         simulation_reflection = self.gtai_adapter.run_recursive_simulation()
         avg_reward = statistics.mean(self.gtai_adapter.awareness_changes) if self.gtai_adapter.awareness_changes else 0.0
         tuning_meta = self.gtai_adapter.tune_analysis_parameters(avg_reward)
