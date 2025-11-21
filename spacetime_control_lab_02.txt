@@ -1,0 +1,638 @@
+﻿#!/usr/bin/env python3
+"""spacetime_control_lab_02
+===========================
+
+
+This module engineers a discrete-λ-stable spacetime cavity whose axisymmetric
+curvature, information density, and stress-energy are co-regulated by the
+unified potential
+
+
+    U(x) = R(x) + gamma * S(x) + delta * rho_eff(x).
+
+
+It couples that geometric control loop to semiclassical evaporation diagnostics,
+echo spectroscopy, and warp-bubble stress-energy/QEI auditing in a single
+reproducible instrument.  The lab exposes a single configuration dictionary
+(`CONFIGURATION_KEY`) that governs geometry resolution, scalar-field physics,
+renormalisation flow, Hawking-channel parameters, warp energetics, numerical
+integration, parameter sweeps, and validation tolerances.  Runs may operate in
+single-shot or sweep mode; both produce auditable artefacts with explicit units
+for downstream analysis.  The lab is not a toy visualiser—it is a feasibility
+mapper intended to surface scaling laws and principle violations in engineered
+curvature structures.
+"""
+
+
+from __future__ import annotations
+
+
+import csv
+import json
+import math
+import os
+import time
+from dataclasses import asdict, dataclass, field
+from itertools import product
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Tuple
+
+
+import numpy as np
+
+
+
+
+LAB_VERSION = "SpacetimeControlLab_v2.1"
+
+
+# Physical constants ---------------------------------------------------------
+C_LIGHT = 299_792_458.0  # [m/s]
+HBAR = 1.054_571_817e-34  # [J*s]
+G_NEWTON = 6.674_30e-11  # [m^3/(kg*s^2)]
+PI = math.pi
+
+
+
+
+# Configuration dictionary ---------------------------------------------------
+CONFIGURATION_KEY: Dict[str, Any] =
+    "GEOMETRY": {
+        "metricprofile": "alcubierrelike",
+        "warpwallthicknessm": 3.5,
+        "bubblespeedfractionc": 0.6,
+        "warpradiusm": 12.0
+    },
+    "FIELD": {
+        "scalarmasseV": 1e-8
+    },
+    "BLACKHOLECHANNEL": {
+        "bhinitialmasskg": 5e30,
+        "enableevaporation": True,
+        "enableechoes": True,
+        "cavityreflectivity": 0.55,
+        "qnmf220Hz": 200.0,
+        "hawkingalpha1": 2000.0,
+        "hawkingalpha2": -4.0e5,
+        "evaporationhaltmasskg": 5e28
+    },
+    "WARPCHANNEL": {
+        "enablewarpmodule": True,
+    },
+    "RUN": {
+        "runrgflow": True,
+        "rglearningrate": 0.15,
+        "rgdamping": 0.85,
+        "rgtargetvariance": 1e-3
+    },
+    "SWEEP": {
+        "enableparamsweep": True,
+        "sweepvariables": {
+            "warpradiusm": [12.0, 14.0],
+            "gammacoupling": [1.5, 1.8, 2.3],
+            "warpwallthicknessm": [2.5, 3.5]
+        },
+        "sweepmaxruns": 18
+    }
+}
+
+
+# Dataclasses ----------------------------------------------------------------
+
+
+@dataclass
+class SimConfig:
+    """Flattened configuration for quick attribute access."""
+
+
+    lambda_scale: float
+    radial_points: int
+    axial_points: int
+    extent_m: float
+    metric_profile: str
+    bubble_radius_m: float
+    warp_wall_thickness_m: float
+    geometry_profile_scale_m: float
+    gamma_coupling: float
+    delta_coupling: float
+    run_rg_flow: bool
+    rg_learning_rate: float
+    rg_damping: float
+    rg_target_variance: float
+
+
+    scalar_mass_eV: float
+    self_coupling_lambda: float
+    xi_curvature_coupling: float
+    noise_amplitude: float
+    noise_spectral_index: float
+    stochastic_seed: int
+
+
+    bh_initial_mass_kg: float
+    enable_evaporation: bool
+    enable_echoes: bool
+    cavity_reflectivity: float
+    qnm_f220_Hz: float
+    hawking_alpha1: float
+    hawking_alpha2: float
+    evaporation_halt_mass_kg: float
+
+
+    enable_warp_module: bool
+    warp_radius_m: float
+    warp_wall_thickness_warp_m: float
+    bubble_speed_fraction_c: float
+    worldline_gamma: float
+    qei_sampling_time_s: float
+    geodesic_steps: int
+
+
+    dt_s: float
+    n_steps: int
+    cfl_safety_factor: float
+    metric_update_interval: int
+    rng_seed: int
+    stability_clip: float
+    output_directory: str
+
+
+    sweep_enable: bool
+    sweep_variables: Dict[str, List[float]]
+    sweep_max_runs: int
+    sweep_csv: str
+    sweep_json: str
+
+
+    lambda_overlap_threshold: float
+    qei_ratio_ceiling: float
+    nec_tolerance: float
+    wec_tolerance: float
+    dec_tolerance: float
+    sec_tolerance: float
+    violation_fraction_ceiling: float
+    negative_energy_threshold_Jpm3: float
+    contradiction_halt: bool
+    validation_profile: str
+    energetics_mode: str
+
+
+
+
+@dataclass
+class SimState:
+    """Mutable state of the simulation at runtime."""
+
+
+    t_s: float
+    r_grid_m: np.ndarray
+    z_grid_m: np.ndarray
+    metric_rr: np.ndarray
+    metric_zz: np.ndarray
+    metric_rz: np.ndarray
+    metric_det: np.ndarray
+    curvature_R_1pm2: np.ndarray
+    psi_field: np.ndarray
+    entropy_density: np.ndarray
+    rho_eff_Jpm3: np.ndarray
+    Tmunu_Jpm3: np.ndarray
+    bh_mass_kg: float
+    bh_mass_history_kg: List[float]
+    hawking_power_W: List[float]
+    lambda_invariant_overlap: float
+    rng: np.random.Generator
+    diagnostics: Dict[str, Any]
+    energy_condition_history: List[Dict[str, bool]] = field(default_factory=list)
+    qei_history: List[float] = field(default_factory=list)
+    t00_stats_history: List[Tuple[float, float, float]] = field(default_factory=list)
+    ricci_stats_history: List[Tuple[float, float, float]] = field(default_factory=list)
+    simulation_crashed: bool = False
+    last_dt: float = 0.0
+
+
+
+
+@dataclass
+class SweepResultRow:
+    """Row summarising a single sweep run."""
+
+
+    config: Dict[str, Any]
+    summary: Dict[str, Any]
+    diagnostics: Dict[str, Any]
+    physically_viable: bool
+    geometry_unstable: bool
+    stress_unphysical: bool
+    simulation_crashed: bool
+    validation_profile: str
+
+
+
+
+@dataclass
+class ScalingFits:
+    """Least-squares scaling fit coefficients for sweep analysis."""
+
+
+    negative_energy_fit: Dict[str, float]
+    echo_delay_fit: Dict[str, float]
+
+
+
+
+# Utility functions ----------------------------------------------------------
+
+
+def _deep_copy_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(data))
+
+
+
+
+def _deep_update(base: Dict[str, Any], updates: Dict[str, Any]) -> None:
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update(base[key], value)
+        else:
+            base[key] = value
+
+
+
+
+def build_config(overrides: Dict[str, Any] | None = None) -> SimConfig:
+    """Merge CONFIGURATION_KEY with user overrides and emit SimConfig."""
+
+
+    cfg_dict = _deep_copy_dict(CONFIGURATION_KEY)
+    if overrides:
+        _deep_update(cfg_dict, overrides)
+
+
+    # Apply literature constraint profiles
+    validation = cfg_dict["VALIDATION"]
+    profile = validation.get("literature_constraint_profiles", "conservative")
+    if profile == "conservative":
+        validation["qei_ratio_ceiling"] = min(validation["qei_ratio_ceiling"], 0.8)
+        validation["violation_fraction_ceiling"] = min(
+            validation["violation_fraction_ceiling"], 0.08
+        )
+    elif profile == "aggressive":
+        validation["qei_ratio_ceiling"] = max(validation["qei_ratio_ceiling"], 0.95)
+        validation["violation_fraction_ceiling"] = max(
+            validation["violation_fraction_ceiling"], 0.2
+        )
+
+
+    geom = cfg_dict["GEOMETRY"]
+    field_cfg = cfg_dict["FIELD"]
+    bh_cfg = cfg_dict["BLACK_HOLE_CHANNEL"]
+    warp_cfg = cfg_dict["WARP_CHANNEL"]
+    num_cfg = cfg_dict["NUMERICS"]
+    sweep_cfg = cfg_dict["SWEEP"]
+
+
+    return SimConfig(
+        lambda_scale=geom["lambda_scale"],
+        radial_points=geom["radial_points"],
+        axial_points=geom["axial_points"],
+        extent_m=geom["extent_m"],
+        metric_profile=geom["metric_profile"],
+        bubble_radius_m=geom["bubble_radius_m"],
+        warp_wall_thickness_m=geom["warp_wall_thickness_m"],
+        geometry_profile_scale_m=geom["geometry_profile_scale_m"],
+        gamma_coupling=geom["gamma_coupling"],
+        delta_coupling=geom["delta_coupling"],
+        run_rg_flow=geom["run_rg_flow"],
+        rg_learning_rate=geom["rg_learning_rate"],
+        rg_damping=geom["rg_damping"],
+        rg_target_variance=geom["rg_target_variance"],
+        scalar_mass_eV=field_cfg["scalar_mass_eV"],
+        self_coupling_lambda=field_cfg["self_coupling_lambda"],
+        xi_curvature_coupling=field_cfg["xi_curvature_coupling"],
+        noise_amplitude=field_cfg["noise_amplitude"],
+        noise_spectral_index=field_cfg["noise_spectral_index"],
+        stochastic_seed=field_cfg["stochastic_seed"],
+        bh_initial_mass_kg=bh_cfg["bh_initial_mass_kg"],
+        enable_evaporation=bh_cfg["enable_evaporation"],
+        enable_echoes=bh_cfg["enable_echoes"],
+        cavity_reflectivity=bh_cfg["cavity_reflectivity"],
+        qnm_f220_Hz=bh_cfg["qnm_f220_Hz"],
+        hawking_alpha1=bh_cfg["hawking_alpha1"],
+        hawking_alpha2=bh_cfg["hawking_alpha2"],
+        evaporation_halt_mass_kg=bh_cfg["evaporation_halt_mass_kg"],
+        enable_warp_module=warp_cfg["enable_warp_module"],
+        warp_radius_m=warp_cfg["warp_radius_m"],
+        warp_wall_thickness_warp_m=warp_cfg["warp_wall_thickness_m"],
+        bubble_speed_fraction_c=warp_cfg["bubble_speed_fraction_c"],
+        worldline_gamma=warp_cfg["worldline_gamma"],
+        qei_sampling_time_s=warp_cfg["qei_sampling_time_s"],
+        geodesic_steps=warp_cfg["geodesic_steps"],
+        dt_s=num_cfg["dt_s"],
+        n_steps=num_cfg["n_steps"],
+        cfl_safety_factor=num_cfg["cfl_safety_factor"],
+        metric_update_interval=num_cfg["metric_update_interval"],
+        rng_seed=num_cfg["rng_seed"],
+        stability_clip=num_cfg["stability_clip"],
+        output_directory=num_cfg["output_directory"],
+        sweep_enable=sweep_cfg["enable_param_sweep"],
+        sweep_variables=sweep_cfg["sweep_variables"],
+        sweep_max_runs=sweep_cfg["sweep_max_runs"],
+        sweep_csv=sweep_cfg["output_sweep_csv"],
+        sweep_json=sweep_cfg["output_sweep_json"],
+        lambda_overlap_threshold=validation["lambda_overlap_threshold"],
+        qei_ratio_ceiling=validation["qei_ratio_ceiling"],
+        nec_tolerance=validation["nec_tolerance"],
+        wec_tolerance=validation["wec_tolerance"],
+        dec_tolerance=validation["dec_tolerance"],
+        sec_tolerance=validation["sec_tolerance"],
+        violation_fraction_ceiling=validation["violation_fraction_ceiling"],
+        negative_energy_threshold_Jpm3=validation["negative_energy_threshold_Jpm3"],
+        contradiction_halt=validation["contradiction_halt"],
+        validation_profile=validation["literature_constraint_profiles"],
+        energetics_mode=validation["energetics_mode"],
+    )
+
+
+
+
+# Geometry construction ------------------------------------------------------
+
+
+def _make_grid(cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    r = np.linspace(0.0, cfg.extent_m, cfg.radial_points)
+    z = np.linspace(-cfg.extent_m, cfg.extent_m, cfg.axial_points)
+    rr, zz = np.meshgrid(r, z, indexing="ij")
+    dr = cfg.extent_m / max(cfg.radial_points - 1, 1)
+    dz = 2 * cfg.extent_m / max(cfg.axial_points - 1, 1)
+    return rr, zz, dr, dz
+
+
+
+
+def _alcubierre_metric(rr: np.ndarray, zz: np.ndarray, cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    r = np.sqrt(rr**2 + zz**2)
+    sigma = cfg.warp_wall_thickness_m
+    bubble = np.exp(-((r - cfg.warp_radius_m) ** 2) / (sigma**2 + 1e-12))
+    metric_rr = 1.0 + 0.1 * bubble
+    metric_zz = 1.0 - 0.1 * bubble
+    metric_rz = 0.0 * rr
+    return metric_rr, metric_zz, metric_rz
+
+
+
+
+def _morris_thorne_metric(rr: np.ndarray, zz: np.ndarray, cfg: SimConfig) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    b0 = cfg.geometry_profile_scale_m
+    r = np.sqrt(rr**2 + zz**2) + 1e-6
+    shape = b0**2 / r**2
+    metric_rr = 1.0 / (1.0 - shape)
+    metric_zz = 1.0 + shape
+    metric_rz = np.zeros_like(rr)
+    return metric_rr, metric_zz, metric_rz
+
+
+
+
+def _construct_metric(cfg: SimConfig, rr: np.ndarray, zz: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if cfg.metric_profile == "alcubierre_like":
+        g_rr, g_zz, g_rz = _alcubierre_metric(rr, zz, cfg)
+    elif cfg.metric_profile == "morris_thorne":
+        g_rr, g_zz, g_rz = _morris_thorne_metric(rr, zz, cfg)
+    else:
+        raise ValueError(f"Unknown metric profile {cfg.metric_profile}")
+
+
+    metric_det = g_rr * g_zz - g_rz**2
+    return g_rr, g_zz, g_rz, metric_det
+
+
+
+
+def _compute_ricci_scalar(g_rr: np.ndarray, g_zz: np.ndarray, g_rz: np.ndarray, dr: float, dz: float) -> np.ndarray:
+    """Crude Ricci scalar proxy from metric second derivatives."""
+    # Using simplified 2D expression approximating curvature of axisymmetric slice.
+    d_rr = np.gradient(g_rr, dr, axis=0)
+    d_rz = np.gradient(g_rr, dz, axis=1)
+    d_zz = np.gradient(g_zz, dz, axis=1)
+    lap_rr = np.gradient(d_rr, dr, axis=0) + np.gradient(d_rz, dz, axis=1)
+    lap_zz = np.gradient(np.gradient(g_zz, dr, axis=0), dr, axis=0) + np.gradient(d_zz, dz, axis=1)
+    R = lap_rr + lap_zz - np.gradient(np.gradient(g_rz, dr, axis=0), dz, axis=1)
+    return np.clip(R, -1e2, 1e2)
+
+
+
+
+# Scalar-field evolution -----------------------------------------------------
+
+
+def _laplacian(field: np.ndarray, dr: float, dz: float) -> np.ndarray:
+    d2_r = (np.roll(field, -1, axis=0) - 2 * field + np.roll(field, 1, axis=0)) / (dr**2)
+    d2_z = (np.roll(field, -1, axis=1) - 2 * field + np.roll(field, 1, axis=1)) / (dz**2)
+    return d2_r + d2_z
+
+
+
+
+def _apply_colored_noise(rng: np.random.Generator, shape: Tuple[int, int], amplitude: float, spectral_index: float) -> np.ndarray:
+    noise = rng.normal(size=shape)
+    noise_fft = np.fft.fftn(noise)
+    kx = np.fft.fftfreq(shape[0])
+    kz = np.fft.fftfreq(shape[1])
+    kk = np.sqrt(kx[:, None] ** 2 + kz[None, :] ** 2) + 1e-6
+    spectrum = kk ** (spectral_index / 2.0)
+    filtered = np.fft.ifftn(noise_fft * spectrum).real
+    filtered *= amplitude / (np.std(filtered) + 1e-12)
+    return filtered
+
+
+
+
+def _scalar_potential_derivative(psi: np.ndarray, cfg: SimConfig) -> np.ndarray:
+    mass_term = (cfg.scalar_mass_eV * 1.602176634e-19 / (HBAR * C_LIGHT)) ** 2
+    return mass_term * psi + cfg.self_coupling_lambda * psi**3
+
+
+
+
+def _rk4_scalar_step(state: SimState, cfg: SimConfig, dr: float, dz: float, curvature: np.ndarray, dt: float) -> np.ndarray:
+
+
+    def rhs(psi: np.ndarray) -> np.ndarray:
+        lap = _laplacian(psi, dr, dz)
+        potential = _scalar_potential_derivative(psi, cfg)
+        return lap - potential + cfg.xi_curvature_coupling * curvature * psi
+
+
+    k1 = rhs(state.psi_field)
+    k2 = rhs(state.psi_field + 0.5 * dt * k1)
+    k3 = rhs(state.psi_field + 0.5 * dt * k2)
+    k4 = rhs(state.psi_field + dt * k3)
+    psi_next = state.psi_field + dt / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
+    return np.clip(psi_next, -cfg.stability_clip, cfg.stability_clip)
+
+
+
+
+def _compute_entropy_density(psi: np.ndarray) -> np.ndarray:
+    eps = 1e-12
+    magnitude = np.abs(psi)
+    return magnitude**2 * np.log(magnitude**2 + eps)
+
+
+
+
+def _compute_rho_eff(psi: np.ndarray, dr: float, dz: float, cfg: SimConfig) -> np.ndarray:
+    grad_r = np.gradient(psi, dr, axis=0)
+    grad_z = np.gradient(psi, dz, axis=1)
+    kinetic = 0.5 * (grad_r**2 + grad_z**2)
+    potential = 0.25 * cfg.self_coupling_lambda * psi**4
+    return kinetic + potential
+
+
+
+
+def _compute_stress_energy(rho_eff: np.ndarray, cfg: SimConfig) -> np.ndarray:
+    T = np.zeros((4, *rho_eff.shape))
+    T[0] = rho_eff
+    pressure = rho_eff / 3.0
+    for i in range(1, 4):
+        T[i] = pressure
+    if cfg.energetics_mode == "classical":
+        T[0] = np.maximum(T[0], 0.0)
+    return T
+
+
+
+
+def _compute_energy_conditions(Tmunu: np.ndarray) -> Dict[str, bool]:
+    rho = np.mean(Tmunu[0])
+    p = np.mean(Tmunu[1])
+    nec = bool(rho + p >= 0.0)
+    wec = bool(rho >= 0.0 and nec)
+    dec = bool(rho >= abs(p))
+    sec = bool(rho + 3.0 * p >= 0.0)
+    return {"NEC": nec, "WEC": wec, "DEC": dec, "SEC": sec}
+
+
+
+
+def _ford_roman_qei(T00: np.ndarray, cfg: SimConfig) -> float:
+    tau = cfg.qei_sampling_time_s
+    avg = float(np.mean(T00))
+    bound = -3.0 / (32.0 * (PI**2) * tau**4)
+    ratio = 0.0 if avg >= 0 else avg / bound
+    return float(np.clip(ratio, 0.0, 1.5))
+
+
+
+
+def _lambda_overlap(psi: np.ndarray, cfg: SimConfig) -> float:
+    scale = cfg.lambda_scale
+    rr = np.linspace(0, psi.shape[0] - 1, psi.shape[0]) / scale
+    zz = np.linspace(0, psi.shape[1] - 1, psi.shape[1]) / scale
+    r_idx = np.clip(np.round(rr).astype(int), 0, psi.shape[0] - 1)
+    z_idx = np.clip(np.round(zz).astype(int), 0, psi.shape[1] - 1)
+    psi_scaled = psi[np.ix_(r_idx, z_idx)]
+    min_r = min(psi.shape[0], psi_scaled.shape[0])
+    min_z = min(psi.shape[1], psi_scaled.shape[1])
+    a = psi[:min_r, :min_z].reshape(-1)
+    b = psi_scaled[:min_r, :min_z].reshape(-1)
+    num = float(np.dot(a, b))
+    den = float(np.linalg.norm(a) * np.linalg.norm(b) + 1e-14)
+    return float(np.clip(num / den, -1.0, 1.0))
+
+
+
+
+def _hawking_power(mass_kg: float, cfg: SimConfig) -> float:
+    if mass_kg <= 0:
+        return 0.0
+    base = HBAR * C_LIGHT**6 / (15360.0 * PI * (G_NEWTON**2) * mass_kg**2)
+    correction = 1.0 + cfg.hawking_alpha1 / mass_kg + cfg.hawking_alpha2 / (mass_kg**2)
+    correction = max(correction, 0.0)
+    return base * correction
+
+
+
+
+def _rk4_evaporation_step(mass_kg: float, cfg: SimConfig, dt: float) -> Tuple[float, float]:
+
+
+    def rhs(mass: float) -> float:
+        power = _hawking_power(max(mass, cfg.evaporation_halt_mass_kg), cfg)
+        return -power / (C_LIGHT**2)
+
+
+    k1 = rhs(mass_kg)
+    k2 = rhs(mass_kg + 0.5 * dt * k1)
+    k3 = rhs(mass_kg + 0.5 * dt * k2)
+    k4 = rhs(mass_kg + dt * k3)
+    new_mass = mass_kg + dt / 6.0 * (k1 + 2 * k2 + 2 * k3 + k4)
+    new_mass = max(new_mass, cfg.evaporation_halt_mass_kg)
+    power = _hawking_power(new_mass, cfg)
+    return new_mass, power
+
+
+
+
+def _echo_characteristics(cfg: SimConfig, rr: np.ndarray, zz: np.ndarray, g_rr: np.ndarray, g_zz: np.ndarray) -> Tuple[float, float]:
+    proper_distance = float(np.mean(np.sqrt(g_rr) * np.abs(np.gradient(rr, axis=0))))
+    proper_distance += float(np.mean(np.sqrt(g_zz) * np.abs(np.gradient(zz, axis=1))))
+    delay = proper_distance / C_LIGHT
+    delta_f = (1.0 - cfg.cavity_reflectivity) * cfg.qnm_f220_Hz
+    return delay, delta_f
+
+
+
+
+def _warp_travel_time(cfg: SimConfig) -> float:
+    distance = 2.0 * cfg.warp_radius_m
+    velocity = max(cfg.bubble_speed_fraction_c * C_LIGHT, 1.0)
+    return distance / velocity * cfg.worldline_gamma
+
+
+
+
+def _update_rg_couplings(cfg: SimConfig, variance: float) -> None:
+    error = variance - cfg.rg_target_variance
+    cfg.gamma_coupling -= cfg.rg_learning_rate * error
+    cfg.delta_coupling -= cfg.rg_learning_rate * error
+    cfg.gamma_coupling *= cfg.rg_damping
+    cfg.delta_coupling *= cfg.rg_damping
+
+
+
+
+def _unified_potential(state: SimState, cfg: SimConfig) -> Tuple[np.ndarray, float]:
+    U = state.curvature_R_1pm2 + cfg.gamma_coupling * state.entropy_density + cfg.delta_coupling * state.rho_eff_Jpm3
+    variance = float(np.var(U))
+    return U, variance
+
+
+
+
+def _apply_energetics_mode(Tmunu: np.ndarray, cfg: SimConfig, qei_ratio: float) -> np.ndarray:
+    if cfg.energetics_mode == "classical":
+        Tmunu[0] = np.maximum(Tmunu[0], 0.0)
+    elif cfg.energetics_mode == "semiclassical":
+        negative_mask = Tmunu[0] < 0
+        if np.any(negative_mask):
+            if qei_ratio > cfg.qei_ratio_ceiling:
+                Tmunu[0][negative_mask] = 0.0
+    else:  # quantum mode allows negative so long as QEI satisfied.
+        pass
+    return Tmunu
+
+
+
+
+def _log_step_diagnostics(state: SimState, cfg: SimConfig) -> None:
+    flags = state.energy_condition_history[-1]
+    qei_ratio = state.qei_history[-1]
+    min_t00, max_t00, mean_t00 = state.t00_stats_history[-1]
+    violation_count = sum(not v for v in flags.values())
+    print(
+        f"[step] t={state.t_s:.4f}s | flags={flags} | T00(min={min_t00:.3e}, "
+        f"max={max_t00:.3e}, mean={mean_t00:.3e}) | QEI={qei_ratio:.3f}"
+    )
+    if violation_count > 0 or min_t00 < cfg.negative_energy_threshold_Jpm3

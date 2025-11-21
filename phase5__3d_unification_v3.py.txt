@@ -1,0 +1,758 @@
+﻿Tab 1
+#!/usr/bin/env python3
+"""Phase 5: Covariant 3D unification driver.
+
+
+This module replaces the previous shell-averaged evolution with a fully
+three-dimensional tensor formulation.  Geometry is represented as a volumetric
+stack of tetrahedra generated from self-similar shells.  Curvature tensors are
+constructed with discrete Levi-Civita operators, while the quantum sector is
+captured through covariance tensors derived from Klein–Gordon mode overlaps.
+
+
+The goals follow the repository "Updated_Unification_Sim_Stack.txt" principles:
+
+
+* implement the semiclassical Einstein equation ``G_{μν} + Λ g_{μν} = 8πG ⟨T_{μν}⟩``;
+* evolve the scale-factor master equation in tensorized, covariant PDE form;
+* derive Ricci tensors from discrete volumetric (tetrahedral) meshes;
+* couple geometry to quantum covariance tensors built from 3D eigenmodes;
+* numerically validate covariance, conservation, and unitarity symmetries.
+
+
+All heavy computations run locally with numpy/scipy.  Results are serialized to
+``outputs/phase5_results.(npz|json)``.
+"""
+from __future__ import annotations
+
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Sequence, Tuple
+
+
+import numpy as np
+from numpy.typing import NDArray
+from scipy.sparse import coo_matrix, csr_matrix
+from scipy.sparse.linalg import eigsh
+
+
+
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+
+
+
+
+@dataclass(frozen=True)
+class Phase5Params:
+    """Simulation parameters controlling the geometric and quantum stacks."""
+
+
+    num_shells: int = 6
+    nodes_per_shell: int = 4
+    lambda_scale: float = math.sqrt(6.0) / 2.0
+    base_radius: float = 1.0
+    between_shell_neighbor_factor: float = 0.45
+    within_shell_neighbor_factor: float = 1.05
+    random_seed: int = 123
+    random_rotate_each_shell: bool = False
+
+
+    # Quantum lattice model settings
+    hopping_strength: float = 1.0
+    onsite_V0: float = 5.0
+    requested_eigenpairs: int = 32
+
+
+    # Covariant PDE coupling constants
+    cosmological_constant: float = 0.08
+    newton_constant: float = 1.0
+    alpha_master: float = 0.35
+    beta_master: float = 0.18
+
+
+    # Scale-factor profile a(x) = (||x|| / base_radius) ** scale_exponent
+    scale_exponent: float = 0.9
+
+
+    # Numerical regularization
+    metric_regularization: float = 1e-6
+    symmetry_tolerance: float = 5e-3
+
+
+
+
+# ---------------------------------------------------------------------------
+# Geometry construction
+# ---------------------------------------------------------------------------
+
+
+
+
+def tetrahedron_vertices(radius: float) -> NDArray[np.float64]:
+    """Return the four vertices of a regular tetrahedron scaled to ``radius``."""
+
+
+    verts = np.array(
+        [
+            [1.0, 1.0, 1.0],
+            [-1.0, -1.0, 1.0],
+            [-1.0, 1.0, -1.0],
+            [1.0, -1.0, -1.0],
+        ]
+    )
+    verts /= np.linalg.norm(verts[0])
+    return verts * radius
+
+
+
+
+def random_rotation_matrix(rng: np.random.Generator) -> NDArray[np.float64]:
+    m = rng.normal(size=(3, 3))
+    q, _ = np.linalg.qr(m)
+    q *= np.sign(np.linalg.det(q))
+    return q
+
+
+
+
+@dataclass(frozen=True)
+class Mesh:
+    """Volumetric tetrahedral mesh of the phase-5 geometry."""
+
+
+    positions: NDArray[np.float64]
+    tetrahedra: NDArray[np.int_]
+    shell_index: NDArray[np.int_]
+    center_index: int
+
+
+
+
+def build_mesh(params: Phase5Params) -> Mesh:
+    rng = np.random.default_rng(params.random_seed)
+
+
+    shells: List[NDArray[np.float64]] = []
+    shell_index: List[int] = []
+    for shell in range(params.num_shells):
+        radius = params.base_radius * (params.lambda_scale ** shell)
+        verts = tetrahedron_vertices(radius)
+        if params.random_rotate_each_shell:
+            verts = (random_rotation_matrix(rng) @ verts.T).T
+        shells.append(verts)
+        shell_index.extend([shell] * params.nodes_per_shell)
+
+
+    # Insert a central node to close the innermost tetrahedra
+    positions = [np.zeros(3)]
+    center_index = 0
+    for verts in shells:
+        positions.extend(list(verts))
+    positions_arr = np.vstack(positions)
+
+
+    shell_idx_arr = np.array([-1] + shell_index, dtype=int)
+
+
+    # Build volumetric tetrahedra: inner shell faces + inter-shell prisms
+    tetrahedra: List[Tuple[int, int, int, int]] = []
+
+
+    # Helper to convert shell-local indices to global indices
+    def node_index(shell: int, local: int) -> int:
+        return 1 + shell * params.nodes_per_shell + local
+
+
+    # Base shell tets connecting center to shell 0 faces
+    base_faces = [
+        (1, 2, 3),
+        (0, 2, 3),
+        (0, 1, 3),
+        (0, 1, 2),
+    ]
+    if params.num_shells > 0:
+        for face in base_faces:
+            tetrahedra.append(
+                (
+                    center_index,
+                    node_index(0, face[0]),
+                    node_index(0, face[1]),
+                    node_index(0, face[2]),
+                )
+            )
+
+
+    # Inter-shell tetrahedra (four per shell gap)
+    for shell in range(params.num_shells - 1):
+        lower_nodes = [node_index(shell, i) for i in range(params.nodes_per_shell)]
+        upper_nodes = [node_index(shell + 1, i) for i in range(params.nodes_per_shell)]
+        for outer_idx, face in enumerate(base_faces):
+            tetrahedra.append(
+                (
+                    lower_nodes[face[0]],
+                    lower_nodes[face[1]],
+                    lower_nodes[face[2]],
+                    upper_nodes[outer_idx],
+                )
+            )
+
+
+    tetrahedra_arr = np.array(tetrahedra, dtype=int)
+    return Mesh(positions_arr, tetrahedra_arr, shell_idx_arr, center_index)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Discrete differential geometry utilities
+# ---------------------------------------------------------------------------
+
+
+
+
+def tetra_volume(vertices: NDArray[np.float64]) -> float:
+    p0, p1, p2, p3 = vertices
+    mat = np.vstack((p1 - p0, p2 - p0, p3 - p0)).T
+    return abs(np.linalg.det(mat)) / 6.0
+
+
+
+
+def tetra_barycentric_gradients(vertices: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return gradients of the barycentric coordinates for a tetrahedron."""
+
+
+    p0, p1, p2, p3 = vertices
+    mat = np.vstack((p1 - p0, p2 - p0, p3 - p0)).T
+    inv = np.linalg.inv(mat)
+    grad_lambda1 = inv[:, 0]
+    grad_lambda2 = inv[:, 1]
+    grad_lambda3 = inv[:, 2]
+    grad_lambda0 = -grad_lambda1 - grad_lambda2 - grad_lambda3
+    return np.vstack((grad_lambda0, grad_lambda1, grad_lambda2, grad_lambda3))
+
+
+
+
+def tetra_centroid(vertices: NDArray[np.float64]) -> NDArray[np.float64]:
+    return vertices.mean(axis=0)
+
+
+
+
+def build_tetra_neighbors(mesh: Mesh) -> List[List[int]]:
+    """Return face-adjacent tetrahedron neighbors."""
+
+
+    face_to_tet: Dict[Tuple[int, int, int], int] = {}
+    neighbors: List[List[int]] = [[] for _ in range(len(mesh.tetrahedra))]
+    faces = [
+        (0, 1, 2),
+        (0, 1, 3),
+        (0, 2, 3),
+        (1, 2, 3),
+    ]
+    for idx, tet in enumerate(mesh.tetrahedra):
+        for face in faces:
+            key = tuple(sorted(int(tet[i]) for i in face))
+            if key in face_to_tet:
+                other = face_to_tet[key]
+                neighbors[idx].append(other)
+                neighbors[other].append(idx)
+            else:
+                face_to_tet[key] = idx
+    return neighbors
+
+
+
+
+def spatial_metric(vertices: NDArray[np.float64], regularization: float) -> NDArray[np.float64]:
+    """Compute a symmetric positive definite spatial metric tensor."""
+
+
+    centroid = tetra_centroid(vertices)
+    shifted = vertices - centroid
+    gram = np.zeros((3, 3), dtype=float)
+    for vec in shifted:
+        gram += np.outer(vec, vec)
+    gram /= vertices.shape[0]
+    gram += np.eye(3) * regularization
+    return gram
+
+
+
+
+def assemble_metric_tensor(mesh: Mesh, params: Phase5Params) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return metric tensors ``g`` and inverses ``g_inv`` per tetrahedron."""
+
+
+    n_tets = len(mesh.tetrahedra)
+    g = np.zeros((n_tets, 4, 4), dtype=float)
+    g_inv = np.zeros_like(g)
+    for i, tet_indices in enumerate(mesh.tetrahedra):
+        vertices = mesh.positions[tet_indices]
+        g_spatial = spatial_metric(vertices, params.metric_regularization)
+        g[i, 0, 0] = -1.0
+        g[i, 1:, 1:] = g_spatial
+        g_inv[i, 0, 0] = -1.0
+        g_inv[i, 1:, 1:] = np.linalg.inv(g_spatial)
+    return g, g_inv
+
+
+
+
+def smooth_metric(
+    g: NDArray[np.float64],
+    neighbors: Sequence[Sequence[int]],
+    iterations: int = 2,
+) -> NDArray[np.float64]:
+    """Smooth the spatial block of the metric to stabilize curvature operators."""
+
+
+    smoothed = g.copy()
+    for _ in range(iterations):
+        updated = smoothed.copy()
+        for idx, nbs in enumerate(neighbors):
+            if not nbs:
+                continue
+            neighbor_mean = np.mean([smoothed[j, 1:, 1:] for j in nbs], axis=0)
+            updated[idx, 1:, 1:] = 0.5 * smoothed[idx, 1:, 1:] + 0.5 * neighbor_mean
+        smoothed = 0.5 * (smoothed + updated)
+    # Ensure symmetry exactly
+    for idx in range(len(smoothed)):
+        smoothed[idx, 1:, 1:] = 0.5 * (
+            smoothed[idx, 1:, 1:] + smoothed[idx, 1:, 1:].T
+        )
+    return smoothed
+
+
+
+
+def least_squares_gradient(
+    centers: NDArray[np.float64],
+    values: NDArray[np.float64],
+    neighbors: Sequence[int],
+    component_idx: int,
+) -> NDArray[np.float64]:
+    """Least-squares gradient for a scalar component over neighboring tets."""
+
+
+    center = centers[component_idx]
+    rows = []
+    rhs = []
+    for nb in neighbors:
+        diff = centers[nb] - center
+        norm = np.linalg.norm(diff)
+        if norm == 0:
+            continue
+        rows.append(diff)
+        rhs.append(values[nb] - values[component_idx])
+    if not rows:
+        return np.zeros(3)
+    A = np.array(rows)
+    b = np.array(rhs)
+    grad, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return grad
+
+
+
+
+def assemble_metric_gradients(
+    mesh: Mesh,
+    g: NDArray[np.float64],
+    neighbors: Sequence[Sequence[int]],
+) -> NDArray[np.float64]:
+    """Compute spatial derivatives of ``g_{μν}`` for each tetrahedron."""
+
+
+    centers = np.array([tetra_centroid(mesh.positions[tet]) for tet in mesh.tetrahedra])
+    n_tets = len(mesh.tetrahedra)
+    grad = np.zeros((n_tets, 4, 4, 4), dtype=float)  # grad[tet, mu, nu, coord]
+    for idx in range(n_tets):
+        for mu in range(4):
+            for nu in range(mu, 4):
+                comp_values = g[:, mu, nu]
+                grad_vec = least_squares_gradient(centers, comp_values, neighbors[idx], idx)
+                for coord in range(3):
+                    grad[idx, mu, nu, coord + 1] = grad_vec[coord]
+                grad[idx, nu, mu, :] = grad[idx, mu, nu, :]
+    return grad
+
+
+
+
+def assemble_christoffel(
+    g: NDArray[np.float64],
+    g_inv: NDArray[np.float64],
+    grad_g: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return Γ^ρ_{μν} per tetrahedron."""
+
+
+    n_tets = g.shape[0]
+    gamma = np.zeros((n_tets, 4, 4, 4), dtype=float)
+    for t in range(n_tets):
+        for mu in range(4):
+            for nu in range(4):
+                for rho in range(4):
+                    term = 0.0
+                    for sigma in range(4):
+                        inv = g_inv[t, rho, sigma]
+                        partial_mu = grad_g[t, nu, sigma, mu]
+                        partial_nu = grad_g[t, mu, sigma, nu]
+                        partial_sigma = grad_g[t, mu, nu, sigma]
+                        term += inv * (partial_mu + partial_nu - partial_sigma)
+                    gamma[t, rho, mu, nu] = 0.5 * term
+    return gamma
+
+
+
+
+def assemble_gamma_gradients(
+    mesh: Mesh,
+    gamma: NDArray[np.float64],
+    neighbors: Sequence[Sequence[int]],
+) -> NDArray[np.float64]:
+    centers = np.array([tetra_centroid(mesh.positions[tet]) for tet in mesh.tetrahedra])
+    n_tets = len(mesh.tetrahedra)
+    grad = np.zeros((n_tets, 4, 4, 4, 4), dtype=float)  # grad[t, rho, mu, nu, coord]
+    for idx in range(n_tets):
+        for rho in range(4):
+            for mu in range(4):
+                for nu in range(4):
+                    comp_values = gamma[:, rho, mu, nu]
+                    grad_vec = least_squares_gradient(centers, comp_values, neighbors[idx], idx)
+                    for coord in range(3):
+                        grad[idx, rho, mu, nu, coord + 1] = grad_vec[coord]
+    return grad
+
+
+
+
+def assemble_ricci(
+    gamma: NDArray[np.float64],
+    grad_gamma: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute the Ricci tensor per tetrahedron."""
+
+
+    n_tets = gamma.shape[0]
+    ricci = np.zeros((n_tets, 4, 4), dtype=float)
+    for t in range(n_tets):
+        for mu in range(4):
+            for nu in range(4):
+                term1 = 0.0
+                term2 = 0.0
+                term3 = 0.0
+                term4 = 0.0
+                for rho in range(4):
+                    term1 += grad_gamma[t, rho, mu, nu, rho]
+                    term2 += grad_gamma[t, nu, mu, rho, rho]
+                    for sigma in range(4):
+                        term3 += gamma[t, rho, mu, nu] * gamma[t, sigma, rho, sigma]
+                        term4 += gamma[t, rho, mu, sigma] * gamma[t, sigma, nu, rho]
+                ricci[t, mu, nu] = term1 - term2 + term3 - term4
+    return ricci
+
+
+
+
+def scalar_curvature(ricci: NDArray[np.float64], g_inv: NDArray[np.float64]) -> NDArray[np.float64]:
+    return np.einsum("tij,tij->t", g_inv, ricci)
+
+
+
+
+def einstein_tensor(
+    ricci: NDArray[np.float64],
+    scalar: NDArray[np.float64],
+    g: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    n_tets = g.shape[0]
+    einstein = np.zeros_like(ricci)
+    for t in range(n_tets):
+        einstein[t] = ricci[t] - 0.5 * g[t] * scalar[t]
+    return einstein
+
+
+
+
+# ---------------------------------------------------------------------------
+# Quantum covariance sector
+# ---------------------------------------------------------------------------
+
+
+
+
+def build_graph_laplacian(mesh: Mesh, params: Phase5Params) -> csr_matrix:
+    positions = mesh.positions
+    n = len(positions)
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[float] = []
+
+
+    # Connect nodes within tetrahedra
+    for tet in mesh.tetrahedra:
+        for i in range(4):
+            for j in range(i + 1, 4):
+                a = int(tet[i])
+                b = int(tet[j])
+                dist = np.linalg.norm(positions[a] - positions[b])
+                weight = params.hopping_strength * math.exp(-dist)
+                rows.extend([a, b])
+                cols.extend([b, a])
+                data.extend([weight, weight])
+
+
+    # Additional shell-based connections similar to previous phases
+    shell_stride = params.nodes_per_shell
+    for shell in range(params.num_shells - 1):
+        for local in range(shell_stride):
+            a = 1 + shell * shell_stride + local
+            b = 1 + (shell + 1) * shell_stride + local
+            dist = np.linalg.norm(positions[a] - positions[b])
+            weight = params.between_shell_neighbor_factor / (1.0 + dist)
+            rows.extend([a, b])
+            cols.extend([b, a])
+            data.extend([weight, weight])
+
+
+    lap = coo_matrix((data, (rows, cols)), shape=(n, n)).tocsr()
+    diag = np.array(lap.sum(axis=1)).ravel()
+    h = -lap + params.onsite_V0 * np.eye(n)
+    h -= np.diag(diag)
+    return csr_matrix(h)
+
+
+
+
+def compute_mode_covariances(
+    mesh: Mesh,
+    params: Phase5Params,
+    hamiltonian: csr_matrix,
+) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return eigenvalues/eigenvectors and derived covariance tensors."""
+
+
+    k = min(params.requested_eigenpairs, hamiltonian.shape[0] - 2)
+    eigvals, eigvecs = eigsh(hamiltonian, k=k, which="SM")
+
+
+    # Normalize eigenvectors for consistency
+    eigvecs = eigvecs / np.linalg.norm(eigvecs, axis=0, keepdims=True)
+
+
+    return eigvals.real, eigvecs.real
+
+
+
+
+def tetra_mode_gradient(
+    mesh: Mesh,
+    tet_indices: NDArray[np.int_],
+    mode_amplitudes: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    vertices = mesh.positions[tet_indices]
+    grads = tetra_barycentric_gradients(vertices)
+    grad_spatial = np.zeros(3)
+    for node_idx, grad_lambda in zip(tet_indices, grads):
+        grad_spatial += mode_amplitudes[int(node_idx)] * grad_lambda
+    # Extend to 4-vector (time component zero)
+    grad_vec = np.zeros(4)
+    grad_vec[1:] = grad_spatial
+    return grad_vec
+
+
+
+
+def quantum_covariance_tensors(
+    mesh: Mesh,
+    eigvals: NDArray[np.float64],
+    eigvecs: NDArray[np.float64],
+) -> Tuple[NDArray[np.float64], NDArray[np.float64]]:
+    n_tets = len(mesh.tetrahedra)
+    T = np.zeros((n_tets, 4, 4), dtype=float)
+    C = np.zeros_like(T)
+
+
+    for t, tet in enumerate(mesh.tetrahedra):
+        volume = tetra_volume(mesh.positions[tet])
+        if volume == 0:
+            continue
+        for mode_idx, eigenvalue in enumerate(eigvals):
+            amps = eigvecs[:, mode_idx]
+            grad = tetra_mode_gradient(mesh, tet, amps)
+            weight = math.exp(-0.5 * eigenvalue) / max(volume, 1e-8)
+            T[t] += weight * np.outer(grad, grad)
+            C[t] += weight * np.outer(grad, grad)
+        # Energy density contribution from amplitudes themselves (pressure-like)
+        avg_amp = np.mean(eigvecs[tet, :], axis=0)
+        energy_density = np.sum(avg_amp**2)
+        T[t, 0, 0] += energy_density
+        for i in range(1, 4):
+            T[t, i, i] += 0.5 * energy_density
+    # Symmetrize explicitly
+    T = 0.5 * (T + np.transpose(T, axes=(0, 2, 1)))
+    C = 0.5 * (C + np.transpose(C, axes=(0, 2, 1)))
+    return T, C
+
+
+
+
+def smooth_tensor_field(
+    tensor: NDArray[np.float64],
+    neighbors: Sequence[Sequence[int]],
+    iterations: int = 3,
+) -> NDArray[np.float64]:
+    """Apply neighbor averaging to reduce high-frequency fluctuations."""
+
+
+    smoothed = tensor.copy()
+    for _ in range(iterations):
+        updated = smoothed.copy()
+        for idx, nbs in enumerate(neighbors):
+            if not nbs:
+                continue
+            neighbor_mean = np.mean([smoothed[j] for j in nbs], axis=0)
+            updated[idx] = 0.5 * smoothed[idx] + 0.5 * neighbor_mean
+        smoothed = 0.5 * (smoothed + updated)
+    return smoothed
+
+
+
+
+# ---------------------------------------------------------------------------
+# Covariant master equation for a(x)
+# ---------------------------------------------------------------------------
+
+
+
+
+def scale_field_values(mesh: Mesh, params: Phase5Params) -> NDArray[np.float64]:
+    radii = np.linalg.norm(mesh.positions, axis=1)
+    base = params.base_radius
+    return (np.maximum(radii, 1e-8) / base) ** params.scale_exponent
+
+
+
+
+def tetra_scalar_gradient(
+    mesh: Mesh,
+    tet_indices: NDArray[np.int_],
+    scalar_field: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    vertices = mesh.positions[tet_indices]
+    grads = tetra_barycentric_gradients(vertices)
+    grad_spatial = np.zeros(3)
+    for node_idx, grad_lambda in zip(tet_indices, grads):
+        grad_spatial += scalar_field[int(node_idx)] * grad_lambda
+    grad_vec = np.zeros(4)
+    grad_vec[1:] = grad_spatial
+    return grad_vec
+
+
+
+
+def assemble_scalar_gradients(
+    mesh: Mesh,
+    scalar_field: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    grads = []
+    for tet in mesh.tetrahedra:
+        grads.append(tetra_scalar_gradient(mesh, tet, scalar_field))
+    return np.array(grads)
+
+
+
+
+def assemble_scalar_hessian(
+    mesh: Mesh,
+    grad_scalar: NDArray[np.float64],
+    neighbors: Sequence[Sequence[int]],
+) -> NDArray[np.float64]:
+    centers = np.array([tetra_centroid(mesh.positions[tet]) for tet in mesh.tetrahedra])
+    n_tets = len(mesh.tetrahedra)
+    hessian = np.zeros((n_tets, 4, 4), dtype=float)
+    for idx in range(n_tets):
+        for nu in range(4):
+            comp_values = grad_scalar[:, nu]
+            grad_vec = least_squares_gradient(centers, comp_values, neighbors[idx], idx)
+            for mu in range(3):
+                hessian[idx, mu + 1,
+Tab 2
+
+
+Tab 3
+ G l
+Tab 4
+ 
+Tab 5
+  P
+Tab 6
+
+
+Tab 7
+
+
+Tab 8
+
+
+Tab 9
+
+
+Tab 10
+
+
+Tab 11
+
+
+Tab 12
+
+
+Tab 13
+
+
+Tab 14
+
+
+Tab 15
+
+
+Tab 16
+
+
+Tab 17
+
+
+Tab 18
+
+
+Tab 19
+Yuv m .ll
+Tab 20
+ 
+Tab 21
+
+
+Tab 22
+
+
+Tab 23
+ U
+Tab 24
+
+
+Tab 25
+
+
+Tab 26
+
+
+Tab 27
