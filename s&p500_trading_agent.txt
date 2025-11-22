@@ -1,0 +1,2345 @@
+﻿"""
+Enhanced S&P 500 futures trading model that layers physics-inspired diagnostics
+onto a scale-invariant alpha core. The implementation draws on metric smoothing
+and renormalization routines from the repository's simulation stack and
+incorporates:
+
+
+- Covariant metric drift tracking (metric tensor drift as regime detector).
+- λ-resonant echo detectors for event-flow memory.
+- Negative energy pocket detector for liquidity vacuums.
+- RG-flow drift adaptation for dynamic scaling.
+- Warp gradient detector to react to liquidity wall formation.
+- Lorentz-style event normalization to compensate for tick time dilation.
+- Entanglement surface estimator for cross-instrument curvature coupling.
+- Topological shock detector for discontinuities in order-flow topology.
+- Multi-resolution curvature cascade for dyadic stress amplification.
+- Geodesic flow tracking for minimal-action LOB transitions.
+- Tensor-field renormalization across temporal scales.
+- Quantum potential estimation for latent low-vol regimes.
+- Phase-space trajectory curvature for price/velocity boundaries.
+- Entropy current vectors for dissipation-aware instability signals.
+- Walk-forward backtesting with alpha aggregation.
+- Lightweight sandbox environment for real-time (paper) training.
+"""
+
+
+from __future__ import annotations
+
+
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+
+import numpy as np
+try:
+    import optuna
+except ImportError:  # pragma: no cover - optional dependency for constrained envs
+    optuna = None
+
+
+# ---------------------------------------------------------------------------
+# Parameter blocks
+# ---------------------------------------------------------------------------
+
+
+
+
+@dataclass
+class ModelParameters:
+    relaxation_constant: float = 0.1
+    curvature_threshold: float = 0.001
+    reference_window: int = 20
+    base_position_size: float = 1.0
+    max_position_size: float = 2.0
+    volatility_window: int = 30
+    # Physics-inspired extensions
+    metric_regularization: float = 1e-3
+    metric_smoothing_iterations: int = 2
+    lambda_resonance: float = 0.35
+    negative_energy_lambda: float = 0.15
+    rg_learning_rate: float = 0.03
+    rg_damping: float = 0.995
+    rg_target_variance: float = 1.0
+    warp_wall_threshold: float = 0.6
+    warp_sigma_sensitivity: float = 0.25
+    echo_window: int = 50
+    pocket_baseline_window: int = 40
+    speed_of_light_scale: float = 1.0
+    time_dilation_weight: float = 0.4
+    entanglement_weight: float = 0.35
+    shock_threshold_std: float = 2.5
+    cascade_levels: int = 3
+    cascade_weight: float = 0.2
+    geodesic_weight: float = 0.35
+    tensor_rg_weight: float = 0.25
+    quantum_potential_weight: float = 0.3
+    phase_space_weight: float = 0.25
+    entropy_current_weight: float = 0.2
+    quantum_bins: int = 40
+    entropy_window: int = 15
+    torsion_weight: float = 0.2
+    holographic_weight: float = 0.25
+    info_renorm_weight: float = 0.3
+    info_baseline_window: int = 60
+    anisotropic_window: int = 25
+    anisotropic_weight: float = 0.25
+    qemb_window: int = 30
+    qemb_decay: float = 0.9
+    qemb_weight: float = 0.2
+    dual_time_weight: float = 0.2
+    # Stability controls
+    gauge_clip: float = 3.0
+    gauge_reg_epsilon: float = 1e-6
+    symplectic_dt: float = 1.0
+    # New physics layers
+    quantum_field_weight: float = 0.95
+    adiabatic_weight: float = 0.1
+    topological_phase_weight: float = 0.1
+    chern_weight: float = 0.15
+    euler_weight: float = 0.1
+    spacetime_micro_weight: float = 0.95
+    sharpe_feedback_lr: float = 0.05
+    sharpe_component_floor: float = 0.05
+    # New diagnostics
+    tda_window: int = 35
+    tda_radius_scale: float = 0.75
+    tda_weight: float = 0.25
+    phase_transition_window: int = 25
+    phase_transition_threshold: float = 0.5
+    phase_transition_weight: float = 0.25
+    energy_window: int = 20
+    energy_weight: float = 0.1
+    # Additional physics layers
+    hamiltonian_window: int = 20
+    hamiltonian_weight: float = 0.95
+    gauge_window: int = 15
+    gauge_weight: float = 0.95
+    noether_window: int = 25
+    noether_weight: float = 0.95
+    decoherence_window: int = 20
+    decoherence_weight: float = 0.1
+    ads_window: int = 15
+    ads_weight: float = 0.1
+
+
+
+
+@dataclass
+class TrainingConfig:
+    transaction_cost: float = 0.25  # ticks per trade
+    lookahead: int = 1
+    train_rounds: int = 10
+    seed: int = 42
+    optimize_metric: str = "sortino"  # or "calmar"
+    optimize_trials: int = 500
+    drawdown_penalty: float = 0.35
+    cv_folds: int = 3
+    walkforward_years: int = 2
+    walkforward_folds_per_year: int = 3
+
+
+
+
+@dataclass
+class BacktestResult:
+    pnl: float
+    returns: np.ndarray
+    equity_curve: np.ndarray
+    sharpe: float
+    trades: int
+    hit_rate: float
+
+
+
+
+@dataclass
+class SandboxOrder:
+    step_idx: int
+    position: float
+    cash: float
+    inventory: float
+    price: float
+    value: float
+
+
+
+
+class PaperTradingEnvironment:
+    """Simple sandbox for practice trading on streamed prices."""
+
+
+    def __init__(self, initial_cash: float = 100_000.0, max_leverage: float = 5.0):
+        self.initial_cash = initial_cash
+        self.cash = initial_cash
+        self.inventory = 0.0
+        self.max_leverage = max_leverage
+        self.history: List[SandboxOrder] = []
+
+
+    def reset(self) -> None:
+        self.cash = self.initial_cash
+        self.inventory = 0.0
+        self.history.clear()
+
+
+    def step(self, price: float, target_position: float, step_idx: int) -> SandboxOrder:
+        notional = price * abs(target_position)
+        max_notional = self.initial_cash * self.max_leverage
+        if notional > max_notional:
+            target_position = math.copysign(max_notional / price, target_position)
+
+
+        # Trade needed to reach target position
+        delta = target_position - self.inventory
+        self.cash -= delta * price
+        self.inventory = target_position
+        value = self.cash + self.inventory * price
+        order = SandboxOrder(step_idx, target_position, self.cash, self.inventory, price, value)
+        self.history.append(order)
+        return order
+
+
+
+
+# ---------------------------------------------------------------------------
+# Physics helpers (adapted from phase5__3d_unification_v3.py.txt)
+# ---------------------------------------------------------------------------
+
+
+
+
+def _spatial_metric(vertices: np.ndarray, regularization: float) -> np.ndarray:
+    centroid = np.mean(vertices, axis=0)
+    shifted = vertices - centroid
+    gram = np.zeros((3, 3), dtype=float)
+    for vec in shifted:
+        gram += np.outer(vec, vec)
+    gram /= max(vertices.shape[0], 1)
+    gram += np.eye(3) * regularization
+    return gram
+
+
+
+
+def _rolling_std(arr: np.ndarray, window: int) -> np.ndarray:
+    out = np.zeros_like(arr, dtype=float)
+    for i in range(len(arr)):
+        start = max(0, i - window + 1)
+        segment = arr[start : i + 1]
+        out[i] = float(np.std(segment))
+    return out
+
+
+
+
+def _ewm_mean(arr: np.ndarray, span: int) -> np.ndarray:
+    if len(arr) == 0:
+        return arr
+    alpha = 2.0 / (span + 1)
+    out = np.zeros_like(arr, dtype=float)
+    out[0] = arr[0]
+    for i in range(1, len(arr)):
+        out[i] = alpha * arr[i] + (1 - alpha) * out[i - 1]
+    return out
+
+
+
+
+def assemble_metric_tensor(depth_snapshot: np.ndarray, regularization: float) -> np.ndarray:
+    """Construct spatial metrics from a LOB depth snapshot.
+
+
+    Args:
+        depth_snapshot: Array with columns [price_offset, size, side] normalized.
+        regularization: Diagonal stabilizer.
+    """
+
+
+    if depth_snapshot.size == 0:
+        return np.eye(4)
+
+
+    # Map 2D depth rows into 3D coordinates (price, size, side)
+    vertices = depth_snapshot[:, :3]
+    g_spatial = _spatial_metric(vertices, regularization)
+    g = np.zeros((4, 4))
+    g[0, 0] = -1.0
+    g[1:, 1:] = g_spatial
+    return g
+
+
+
+
+def smooth_metric(metrics: Sequence[np.ndarray], iterations: int = 2) -> np.ndarray:
+    if not metrics:
+        return np.eye(4)
+    smoothed = np.stack(metrics)
+    for _ in range(iterations):
+        updated = smoothed.copy()
+        for idx in range(len(smoothed)):
+            neighbors = []
+            if idx > 0:
+                neighbors.append(smoothed[idx - 1, 1:, 1:])
+            if idx < len(smoothed) - 1:
+                neighbors.append(smoothed[idx + 1, 1:, 1:])
+            if neighbors:
+                neighbor_mean = np.mean(neighbors, axis=0)
+                updated[idx, 1:, 1:] = 0.5 * smoothed[idx, 1:, 1:] + 0.5 * neighbor_mean
+        smoothed = 0.5 * (smoothed + updated)
+    for idx in range(len(smoothed)):
+        smoothed[idx, 1:, 1:] = 0.5 * (smoothed[idx, 1:, 1:] + smoothed[idx, 1:, 1:].T)
+    return smoothed
+
+
+
+
+def christoffel_magnitude(metric: np.ndarray, metric_derivative: np.ndarray) -> float:
+    """Compute a simplified Christoffel magnitude using temporal metric derivatives."""
+
+
+    g_inv = np.linalg.pinv(metric)
+    # Use temporal derivative as proxy for spatial derivatives
+    gamma = 0.5 * (g_inv @ metric_derivative)
+    return float(np.linalg.norm(gamma, ord="fro"))
+
+
+
+
+def geodesic_flow_action(
+    lob_snapshots: Sequence[np.ndarray], regularization: float, iterations: int
+) -> np.ndarray:
+    """Track minimal-action flow via metric evolution across LOB snapshots."""
+
+
+    if not lob_snapshots:
+        return np.array([])
+
+
+    metrics = [
+        assemble_metric_tensor(snapshot, regularization) for snapshot in lob_snapshots
+    ]
+    smoothed = smooth_metric(metrics, iterations)
+    action = np.zeros(len(smoothed))
+    for i in range(1, len(smoothed)):
+        metric_derivative = smoothed[i] - smoothed[i - 1]
+        action[i] = christoffel_magnitude(smoothed[i], metric_derivative)
+    if action.max() > 0:
+        action /= action.max()
+    return action
+
+
+
+
+def tensor_field_renormalization(field: np.ndarray, levels: int = 3) -> np.ndarray:
+    """Compress curvature tensors across dyadic scales to expose λ-invariants."""
+
+
+    if len(field) == 0:
+        return field
+    accum = np.zeros_like(field, dtype=float)
+    base = field.astype(float)
+    for level in range(1, levels + 1):
+        step = 2**level
+        coarse = base[::step]
+        if len(coarse) < 2:
+            break
+        interp = np.interp(
+            np.linspace(0, len(coarse) - 1, num=len(base)),
+            np.arange(len(coarse)),
+            coarse,
+        )
+        accum += np.tanh(base - interp)
+        base = 0.5 * (base + interp)
+    return accum
+
+
+
+
+def quantum_potential_proxy(prices: np.ndarray, bins: int = 40) -> np.ndarray:
+    """Estimate a Bohmian-style potential from empirical price density."""
+
+
+    if len(prices) == 0:
+        return prices
+    hist, edges = np.histogram(prices, bins=bins, density=True)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    density = np.interp(prices, centers, hist, left=hist[0], right=hist[-1])
+    density = np.maximum(density, 1e-8)
+    sqrt_rho = np.sqrt(density)
+    laplacian = np.gradient(np.gradient(sqrt_rho))
+    potential = -laplacian / (sqrt_rho + 1e-8)
+    return potential
+
+
+
+
+def phase_space_curvature(prices: np.ndarray) -> np.ndarray:
+    """Compute curvature of trajectories in (price, return) phase space."""
+
+
+    if len(prices) < 4:
+        return np.zeros_like(prices)
+    returns = np.concatenate([[0], np.diff(prices)])
+    x_prime = np.gradient(prices)
+    y_prime = np.gradient(returns)
+    x_double = np.gradient(x_prime)
+    y_double = np.gradient(y_prime)
+    numer = np.abs(x_prime * y_double - y_prime * x_double)
+    denom = (x_prime**2 + y_prime**2) ** 1.5 + 1e-9
+    curvature = numer / denom
+    return curvature
+
+
+
+
+def entropy_current(
+    volumes: Optional[np.ndarray], spreads: Optional[np.ndarray], event_flow: Optional[np.ndarray], window: int
+) -> np.ndarray:
+    """Compute entropy flux from volume/spread/event arrival distributions."""
+
+
+    if volumes is None or spreads is None or event_flow is None:
+        return np.array([])
+    n = min(len(volumes), len(spreads), len(event_flow))
+    ent = np.zeros(n)
+    vol = np.abs(volumes[:n]) + 1e-6
+    inv_spread = 1 / (np.abs(spreads[:n]) + 1e-6)
+    flow = np.abs(event_flow[:n]) + 1e-6
+    for i in range(n):
+        start = max(0, i - window + 1)
+        seg = np.stack([vol[start : i + 1], inv_spread[start : i + 1], flow[start : i + 1]])
+        probs = seg / np.sum(seg, axis=0, keepdims=True)
+        s = -np.sum(probs * np.log(probs + 1e-9), axis=0)
+        ent[i] = np.mean(s)
+    current = np.gradient(ent)
+    if np.max(np.abs(current)) > 0:
+        current = current / np.max(np.abs(current))
+    return current
+
+
+
+
+def torsion_tensor(prices: np.ndarray, volumes: Optional[np.ndarray] = None) -> np.ndarray:
+    """Approximate torsion of price/volume trajectories to capture twist-like flow."""
+
+
+    n = len(prices)
+    if n < 4:
+        return np.zeros_like(prices)
+
+
+    vol_norm = (
+        (volumes[:n] / (np.mean(volumes[:n]) + 1e-6)) if volumes is not None else np.zeros(n)
+    )
+    path = np.stack([prices, vol_norm, np.linspace(0, 1, n)], axis=1)
+    r1 = np.gradient(path, axis=0)
+    r2 = np.gradient(r1, axis=0)
+    r3 = np.gradient(r2, axis=0)
+    cross = np.cross(r1, r2)
+    numer = np.einsum("ij,ij->i", cross, r3)
+    denom = np.linalg.norm(cross, axis=1) ** 2 + 1e-9
+    torsion = numer / denom
+    if np.max(np.abs(torsion)) > 0:
+        torsion = torsion / np.max(np.abs(torsion))
+    return torsion
+
+
+
+
+def holographic_depth_reweighting(lob_snapshots: Sequence[np.ndarray]) -> np.ndarray:
+    """Reweight depth using entropy and mutual information style coupling."""
+
+
+    if not lob_snapshots:
+        return np.array([])
+    signal = np.zeros(len(lob_snapshots))
+    for idx, snap in enumerate(lob_snapshots):
+        if snap.size == 0:
+            continue
+        sizes = np.abs(snap[:, 1])
+        sides = np.sign(snap[:, 2])
+        total = np.sum(sizes) + 1e-9
+        p = sizes / total
+        entropy = -np.sum(p * np.log(p + 1e-9))
+        weight = 1.0 / (entropy + 1e-6)
+        half = len(sizes) // 2
+        inner = sizes[:half] if half > 0 else sizes
+        outer = sizes[half:] if half > 0 else sizes
+        corr = 0.0
+        if len(inner) > 1 and len(outer) > 1:
+            c = np.corrcoef(inner, outer)[0, 1]
+            if not np.isnan(c):
+                corr = c
+        mi_proxy = -0.5 * math.log(max(1 - corr**2, 1e-6))
+        imbalance = np.sum(sides * sizes) / total
+        signal[idx] = imbalance * weight * (1 + mi_proxy)
+    if np.max(np.abs(signal)) > 0:
+        signal = signal / np.max(np.abs(signal))
+    return signal
+
+
+
+
+def information_theoretic_renorm(
+    prices: np.ndarray, window: int, baseline_window: int, weight: float
+) -> np.ndarray:
+    """Rescale inputs using rolling KL divergence from a baseline regime."""
+
+
+    if len(prices) < baseline_window + 5:
+        return np.zeros_like(prices)
+    returns = np.diff(np.log(prices + 1e-9), prepend=0)
+    baseline = returns[:baseline_window]
+    bins = 20
+    ref_hist, edges = np.histogram(baseline, bins=bins, density=True)
+    ref_hist = ref_hist + 1e-6
+    ref_hist = ref_hist / ref_hist.sum()
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    kl_series = np.zeros_like(returns)
+    for i in range(len(returns)):
+        start = max(0, i - window + 1)
+        segment = returns[start : i + 1]
+        hist, _ = np.histogram(segment, bins=edges, density=True)
+        hist = hist + 1e-6
+        hist = hist / hist.sum()
+        kl = np.sum(hist * np.log(hist / ref_hist))
+        kl_series[i] = kl
+    scaled = np.tanh(kl_series * weight)
+    return scaled
+
+
+
+
+def anisotropic_stress_field(
+    instrument_prices: Optional[Dict[str, np.ndarray]], window: int, weight: float
+) -> np.ndarray:
+    """Estimate directional pressure via eigen-spread of cross-asset flows."""
+
+
+    if not instrument_prices or len(instrument_prices) < 2:
+        return np.array([])
+    keys = list(instrument_prices.keys())
+    base_len = min(len(v) for v in instrument_prices.values())
+    returns = []
+    for k in keys:
+        r = np.diff(np.log(instrument_prices[k][:base_len] + 1e-9), prepend=0)
+        returns.append(r)
+    ret_matrix = np.stack(returns, axis=1)
+    stress = np.zeros(base_len)
+    for i in range(base_len):
+        start = max(0, i - window + 1)
+        seg = ret_matrix[start : i + 1]
+        if seg.shape[0] < 2:
+            continue
+        cov = np.cov(seg, rowvar=False)
+        eigvals = np.linalg.eigvalsh(cov)
+        lam_max = float(np.max(eigvals))
+        lam_min = float(np.min(eigvals))
+        anisotropy = (lam_max - lam_min) / (np.sum(eigvals) + 1e-9)
+        stress[i] = anisotropy
+    if np.max(np.abs(stress)) > 0:
+        stress = stress / np.max(np.abs(stress))
+    return stress * weight
+
+
+
+
+def quantum_entropic_memory(event_flow: Optional[np.ndarray], window: int, decay: float, weight: float) -> np.ndarray:
+    """Track entropy decay of order flow to emphasize fresh information."""
+
+
+    if event_flow is None or len(event_flow) == 0:
+        return np.array([])
+    n = len(event_flow)
+    entropy_series = np.zeros(n)
+    for i in range(n):
+        start = max(0, i - window + 1)
+        seg = event_flow[start : i + 1]
+        hist, _ = np.histogram(seg, bins=10, density=True)
+        hist = hist + 1e-6
+        hist = hist / hist.sum()
+        entropy_series[i] = -np.sum(hist * np.log(hist))
+    memory = np.zeros(n)
+    ema = entropy_series[0]
+    for i in range(n):
+        ema = decay * ema + (1 - decay) * entropy_series[i]
+        memory[i] = entropy_series[i] - ema
+    if np.max(np.abs(memory)) > 0:
+        memory = memory / np.max(np.abs(memory))
+    return memory * weight
+
+
+
+
+def dual_space_time_embedding(event_flow: Optional[np.ndarray], weight: float) -> np.ndarray:
+    """Embed event-time vs clock-time drift to spot accelerations or freezes."""
+
+
+    if event_flow is None or len(event_flow) == 0:
+        return np.array([])
+    n = len(event_flow)
+    event_speed = np.abs(event_flow) + 1e-6
+    tau = np.cumsum(event_speed)
+    tau_norm = tau / (tau[-1] + 1e-9)
+    clock = np.linspace(0, 1, n)
+    divergence = np.gradient(tau_norm - clock)
+    if np.max(np.abs(divergence)) > 0:
+        divergence = divergence / np.max(np.abs(divergence))
+    return divergence * weight
+
+
+
+
+def _union_find_components(points: np.ndarray, radius: float) -> int:
+    n = len(points)
+    parent = list(range(n))
+
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+
+    def union(x: int, y: int) -> None:
+        rx, ry = find(x), find(y)
+        if rx != ry:
+            parent[ry] = rx
+
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if np.linalg.norm(points[i] - points[j]) <= radius:
+                union(i, j)
+
+
+    roots = {find(i) for i in range(n)}
+    return len(roots)
+
+
+
+
+def topological_flow_signature(
+    prices: np.ndarray,
+    volumes: Optional[np.ndarray],
+    window: int,
+    radius_scale: float,
+    weight: float,
+) -> np.ndarray:
+    """Approximate persistent Betti-0 changes as a topology sentinel."""
+
+
+    if len(prices) == 0:
+        return np.array([])
+
+
+    n = len(prices)
+    n = min(n, len(volumes)) if volumes is not None else n
+    betti0 = np.zeros(n)
+
+
+    returns = np.diff(np.log(prices[:n] + 1e-9), prepend=0)
+    vol_norm = (
+        (volumes[:n] / (np.mean(volumes[:n]) + 1e-6)) if volumes is not None else np.zeros(n)
+    )
+
+
+    for i in range(n):
+        start = max(0, i - window + 1)
+        if i > 0 and (i % 2) == 1:
+            betti0[i] = betti0[i - 1]
+            continue
+        pts = np.stack(
+            [returns[start : i + 1], vol_norm[start : i + 1], np.linspace(0, 1, i - start + 1)],
+            axis=1,
+        )
+        if len(pts) < 3:
+            continue
+        dist_matrix = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+        upper = dist_matrix[np.triu_indices_from(dist_matrix, k=1)]
+        radius = np.median(upper) * radius_scale + 1e-6
+        betti0[i] = _union_find_components(pts, radius)
+
+
+    if np.max(np.abs(betti0)) > 0:
+        betti0 = betti0 / np.max(np.abs(betti0))
+    signature = np.gradient(betti0)
+    if np.max(np.abs(signature)) > 0:
+        signature = signature / np.max(np.abs(signature))
+    return signature * weight
+
+
+
+
+def ising_phase_transition(
+    prices: np.ndarray, window: int, threshold: float, weight: float
+) -> np.ndarray:
+    """Spin-like criticality detector for regime flip gating."""
+
+
+    if len(prices) < 3:
+        return np.zeros_like(prices)
+
+
+    returns = np.diff(prices, prepend=prices[0])
+    spins = np.sign(returns)
+    base_var = np.var(returns[:window]) + 1e-6
+    gating = np.zeros(len(prices))
+
+
+    for i in range(len(prices)):
+        start = max(0, i - window + 1)
+        seg_spins = spins[start : i + 1]
+        seg_ret = returns[start : i + 1]
+        magnetization = np.mean(seg_spins)
+        susceptibility = np.var(seg_spins)
+        temp_ratio = (np.var(seg_ret) / base_var) - 1.0
+        disorder = 1 - abs(magnetization)
+        criticality = disorder * temp_ratio * (susceptibility + 1e-6)
+        gating[i] = np.tanh((criticality - threshold) * weight)
+
+
+    return gating
+
+
+
+
+def energy_dissipation_flow(
+    prices: np.ndarray,
+    volumes: Optional[np.ndarray],
+    event_flow: Optional[np.ndarray],
+    window: int,
+    weight: float,
+) -> np.ndarray:
+    """Track entropy production-like flow as a thermodynamic arrow."""
+
+
+    if volumes is None or event_flow is None or len(prices) == 0:
+        return np.array([])
+
+
+    n = min(len(prices), len(volumes), len(event_flow))
+    returns = np.diff(prices[:n], prepend=prices[0])
+    work = np.abs(returns) * (np.abs(volumes[:n]) + 1e-6)
+    info_flux = np.abs(event_flow[:n]) + 1e-6
+
+
+    dissipation = np.zeros(n)
+    for i in range(n):
+        start = max(0, i - window + 1)
+        seg_work = work[start : i + 1]
+        seg_info = info_flux[start : i + 1]
+        entropy_prod = np.mean(seg_work * seg_info)
+        baseline = np.mean(seg_work) + 1e-9
+        dissipation[i] = entropy_prod - baseline
+
+
+    if np.max(np.abs(dissipation)) > 0:
+        dissipation = dissipation / np.max(np.abs(dissipation))
+    return dissipation * weight
+
+
+
+
+def hamiltonian_energy_surface(prices: np.ndarray, window: int, weight: float) -> np.ndarray:
+    """Map kinetic + potential market energy to expose attractor/repulsor zones."""
+
+
+    if len(prices) < 3:
+        return np.zeros_like(prices)
+
+
+    returns = np.diff(prices, prepend=prices[0])
+    kinetic = 0.5 * (returns ** 2)
+
+
+    potential = np.zeros_like(prices)
+    for i in range(len(prices)):
+        start = max(0, i - window + 1)
+        seg = prices[start : i + 1]
+        mean = np.mean(seg)
+        var = np.var(seg) + 1e-6
+        potential[i] = ((prices[i] - mean) ** 2) / var
+
+
+    surface = kinetic + potential
+    if np.max(surface) > 0:
+        surface = surface / np.max(surface)
+    surface = surface - np.mean(surface)
+    return surface * weight
+
+
+
+
+def gauge_invariant_alignment(
+    prices: np.ndarray,
+    window: int,
+    weight: float,
+    clip_value: float = 3.0,
+    reg_epsilon: float = 1e-6,
+) -> np.ndarray:
+    """Create gauge-invariant deltas while clamping instability and NaNs."""
+
+
+    if len(prices) < 3:
+        return np.zeros_like(prices)
+
+
+    trend = _ewm_mean(prices, span=window)
+    gauge_field = prices - trend
+    local_phase = np.gradient(gauge_field)
+    drift = _ewm_mean(local_phase, span=max(2, window // 2))
+    invariant = local_phase - drift
+    invariant = np.nan_to_num(invariant, nan=0.0, posinf=clip_value, neginf=-clip_value)
+    norm = np.max(np.abs(invariant)) + reg_epsilon
+    invariant = invariant / norm
+    invariant = np.clip(invariant, -clip_value, clip_value)
+    return invariant * weight
+
+
+
+
+def noether_symmetry_tracker(
+    prices: np.ndarray, volumes: Optional[np.ndarray], window: int, weight: float
+) -> np.ndarray:
+    """Detect conserved-like patterns (time/scale/polarity) in order flow."""
+
+
+    if len(prices) < 4:
+        return np.zeros_like(prices)
+
+
+    returns = np.diff(np.log(prices + 1e-9), prepend=0)
+    vol = (np.abs(volumes[: len(returns)]) if volumes is not None else np.ones_like(returns))
+    symmetry = np.zeros_like(returns)
+
+
+    for i in range(len(returns)):
+        start = max(0, i - window + 1)
+        seg_r = returns[start : i + 1]
+        seg_v = vol[start : i + 1]
+        if len(seg_r) < 3:
+            continue
+        momentum = np.cumsum(seg_r * seg_v)
+        conservation = np.std(momentum) / (np.mean(np.abs(momentum)) + 1e-6)
+        time_sym = np.corrcoef(seg_r[:-1], seg_r[1:])[0, 1] if len(seg_r) > 2 else 0
+        if math.isnan(time_sym):
+            time_sym = 0.0
+        symmetry[i] = (1 - conservation) + time_sym
+
+
+    if np.max(np.abs(symmetry)) > 0:
+        symmetry = symmetry / np.max(np.abs(symmetry))
+    return symmetry * weight
+
+
+
+
+def quantum_decoherence_filter(
+    prices: np.ndarray, event_flow: Optional[np.ndarray], window: int, weight: float
+) -> np.ndarray:
+    """Gate signals when coherence in price/event superpositions collapses."""
+
+
+    if len(prices) < 4 or event_flow is None or len(event_flow) == 0:
+        return np.zeros_like(prices)
+
+
+    n = min(len(prices), len(event_flow))
+    returns = np.diff(np.log(prices[:n] + 1e-9), prepend=0)
+    flow = np.abs(event_flow[:n]) + 1e-6
+    coherence = np.zeros(n)
+    for i in range(n):
+        start = max(0, i - window + 1)
+        seg_r = returns[start : i + 1]
+        seg_f = flow[start : i + 1]
+        if len(seg_r) < 3:
+            continue
+        norm_r = (seg_r - np.mean(seg_r)) / (np.std(seg_r) + 1e-6)
+        norm_f = (seg_f - np.mean(seg_f)) / (np.std(seg_f) + 1e-6)
+        corr = np.corrcoef(norm_r, norm_f)[0, 1]
+        if math.isnan(corr):
+            corr = 0.0
+        coherence[i] = corr
+    decoherence = -np.gradient(coherence)
+    if np.max(np.abs(decoherence)) > 0:
+        decoherence = decoherence / np.max(np.abs(decoherence))
+    return decoherence * weight
+
+
+
+
+def ads_cft_boundary_detector(prices: np.ndarray, window: int, weight: float) -> np.ndarray:
+    """Infer bulk-like stress from boundary price curvature (AdS/CFT analogy)."""
+
+
+    if len(prices) < 4:
+        return np.zeros_like(prices)
+
+
+    grad = np.gradient(prices)
+    curvature = np.gradient(grad)
+    bulk_proxy = np.convolve(np.abs(curvature), np.ones(window) / window, mode="same")
+    boundary_shift = np.gradient(bulk_proxy)
+    if np.max(np.abs(boundary_shift)) > 0:
+        boundary_shift = boundary_shift / np.max(np.abs(boundary_shift))
+    return boundary_shift * weight
+
+
+
+
+def quantum_field_coherence(
+    instrument_prices: Dict[str, np.ndarray],
+    weight: float,
+    reg_epsilon: float = 1e-6,
+) -> np.ndarray:
+    """Estimate gauge-covariant coherence between correlated tickers."""
+
+
+    if not instrument_prices:
+        return np.array([])
+
+
+    keys = list(instrument_prices.keys())
+    base = instrument_prices[keys[0]]
+    min_len = min(len(arr) for arr in instrument_prices.values())
+    if min_len < 4:
+        return np.zeros(min_len)
+
+
+    base_returns = np.diff(np.log(base[:min_len] + 1e-9), prepend=0)
+    coherence = np.zeros(min_len)
+
+
+    for key in keys[1:]:
+        other = instrument_prices[key][:min_len]
+        other_returns = np.diff(np.log(other + 1e-9), prepend=0)
+        drift = np.mean(other_returns)
+        centered_other = other_returns - drift
+        cov = np.cov(base_returns, centered_other)[0, 1]
+        var = np.var(centered_other) + reg_epsilon
+        gauge_cov = cov / var
+        gauge_cov = np.clip(gauge_cov, -5.0, 5.0)
+        coherence += gauge_cov * centered_other
+
+
+    if np.max(np.abs(coherence)) > 0:
+        coherence = coherence / (np.max(np.abs(coherence)) + reg_epsilon)
+    return coherence * weight
+
+
+
+
+def adiabatic_invariant_gate(prices: np.ndarray, window: int, weight: float) -> np.ndarray:
+    """Slow-motion constraint that tempers aggression in steady regimes."""
+
+
+    if len(prices) < 3:
+        return np.zeros_like(prices)
+
+
+    returns = np.diff(prices, prepend=prices[0])
+    energy = _rolling_std(returns, window) ** 2
+    gradient = np.gradient(energy)
+    adiabatic = 1.0 / (1.0 + np.abs(gradient))
+    adiabatic = adiabatic - np.mean(adiabatic)
+    return adiabatic * weight
+
+
+
+
+def topological_phase_embedding(
+    prices: np.ndarray,
+    volumes: Optional[np.ndarray],
+    weight: float,
+    chern_weight: float,
+    euler_weight: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Track global topology via winding (Chern proxy) and Euler characteristics."""
+
+
+    if len(prices) < 4:
+        zero = np.zeros_like(prices)
+        return zero, zero
+
+
+    phase = np.unwrap(np.angle(np.exp(1j * np.diff(prices, prepend=prices[0]))))
+    winding = np.cumsum(phase)
+    chern = np.gradient(winding)
+    chern_norm = chern / (np.max(np.abs(chern)) + 1e-6)
+
+
+    vol = volumes[: len(prices)] if volumes is not None else np.ones_like(prices)
+    vol_grad = np.gradient(vol)
+    curv = np.gradient(np.gradient(prices))
+    euler = (np.sign(curv) * np.sign(vol_grad)).astype(float)
+    euler_smoothed = _ewm_mean(euler, span=max(3, len(euler) // 10))
+    euler_norm = euler_smoothed / (np.max(np.abs(euler_smoothed)) + 1e-6)
+
+
+    topo_signal = weight * (chern_weight * chern_norm + euler_weight * euler_norm)
+    regulator = 1.0 - np.clip(np.abs(topo_signal), 0, 0.5)
+    return topo_signal, regulator
+
+
+
+
+def spacetime_microstructure_curvature(
+    prices: np.ndarray,
+    volumes: Optional[np.ndarray],
+    spreads: Optional[np.ndarray],
+    event_flow: Optional[np.ndarray],
+    weight: float,
+) -> np.ndarray:
+    """Extend metric to price-volume-latency-imbalance space and derive curvature."""
+
+
+    n = len(prices)
+    if n < 4:
+        return np.zeros_like(prices)
+
+
+    vol = volumes[:n] if volumes is not None else np.ones(n)
+    spread = spreads[:n] if spreads is not None else np.ones(n)
+    flow = event_flow[:n] if event_flow is not None else np.zeros(n)
+    latency = 1.0 / (np.abs(flow) + 1e-3)
+    imbalance = np.tanh(flow / (vol + 1e-6))
+
+
+    manifold = np.stack(
+        [
+            prices,
+            vol / (np.max(vol) + 1e-6),
+            spread / (np.max(spread) + 1e-6),
+            latency / (np.max(latency) + 1e-6),
+            imbalance,
+        ],
+        axis=1,
+    )
+
+
+    centroid = np.mean(manifold, axis=0)
+    shifted = manifold - centroid
+    dims = manifold.shape[1]
+    gram = np.zeros((dims, dims), dtype=float)
+    for vec in shifted:
+        gram += np.outer(vec, vec)
+    gram /= max(n, 1)
+    gram += np.eye(dims) * 1e-4
+
+
+    det = np.linalg.det(gram)
+    det_series = np.full(n, det)
+    curvature = np.gradient(np.gradient(np.log(np.abs(det_series) + 1e-6)))
+    if np.max(np.abs(curvature)) > 0:
+        curvature = curvature / np.max(np.abs(curvature))
+    return curvature * weight
+
+
+
+
+# ---------------------------------------------------------------------------
+# Core model
+# ---------------------------------------------------------------------------
+
+
+
+
+class SP500FuturesModel:
+    def __init__(self, params: Optional[ModelParameters] = None):
+        self.params = params or ModelParameters()
+        self.position_history: List[float] = []
+        self.signal_history: List[float] = []
+        self.curvature_history: List[float] = []
+        self.lambda_scale = self.params.lambda_resonance
+        self.component_penalty: Dict[str, int] = {}
+        self.enforce_feature_constraints()
+
+
+    # --- base analytics -------------------------------------------------
+    def enforce_feature_constraints(self) -> None:
+        """Clamp weights according to the risk-aware rules requested."""
+
+
+        upper_locks = {
+            "decoherence_weight": 0.1,
+            "adiabatic_weight": 0.1,
+            "ads_weight": 0.1,
+            "topological_phase_weight": 0.1,
+            "energy_weight": 0.1,
+        }
+        lower_locks = {
+            "gauge_weight": 0.95,
+            "quantum_field_weight": 0.95,
+            "spacetime_micro_weight": 0.95,
+            "hamiltonian_weight": 0.95,
+            "noether_weight": 0.95,
+        }
+
+
+        for name, cap in upper_locks.items():
+            setattr(self.params, name, min(getattr(self.params, name), cap))
+        for name, floor in lower_locks.items():
+            setattr(self.params, name, max(getattr(self.params, name), floor))
+
+
+    def snapshot_weights(self) -> Dict[str, float]:
+        keys = [
+            "gauge_weight",
+            "quantum_field_weight",
+            "spacetime_micro_weight",
+            "hamiltonian_weight",
+            "noether_weight",
+            "decoherence_weight",
+            "adiabatic_weight",
+            "ads_weight",
+            "topological_phase_weight",
+            "energy_weight",
+        ]
+        return {k: float(getattr(self.params, k)) for k in keys}
+
+
+    def _gate_components(
+        self, attribution: Dict[str, Dict[str, float]], scoreboard: Dict[str, Dict[str, float]]
+    ) -> None:
+        component_map = {
+            "hamiltonian_surface": "hamiltonian_weight",
+            "gauge_invariant": "gauge_weight",
+            "noether_symmetry": "noether_weight",
+            "decoherence_filter": "decoherence_weight",
+            "ads_boundary": "ads_weight",
+            "adiabatic_gate": "adiabatic_weight",
+            "topological_phase": "topological_phase_weight",
+            "spacetime_micro": "spacetime_micro_weight",
+            "quantum_field_coherence": "quantum_field_weight",
+            "Negative Energy Pockets": "energy_weight",
+        }
+        combined = {**attribution, **scoreboard}
+        for key, stats in combined.items():
+            if key not in component_map:
+                continue
+            metric = component_map[key]
+            penalty_hit = stats.get("delta_sharpe", 0.0) < 0 or stats.get("max_dd", 0.0) < -0.25
+            if penalty_hit:
+                self.component_penalty[metric] = self.component_penalty.get(metric, 0) + 1
+            else:
+                self.component_penalty[metric] = 0
+            if self.component_penalty.get(metric, 0) >= 2:
+                setattr(self.params, metric, 0.0)
+
+
+    def apply_feedback_and_gate(
+        self,
+        feedback: Dict[str, float],
+        attribution: Dict[str, Dict[str, float]],
+        scoreboard: Dict[str, Dict[str, float]],
+    ) -> None:
+        component_map = {
+            "hamiltonian_surface": "hamiltonian_weight",
+            "gauge_invariant": "gauge_weight",
+            "noether_symmetry": "noether_weight",
+            "decoherence_filter": "decoherence_weight",
+            "ads_boundary": "ads_weight",
+            "adiabatic_gate": "adiabatic_weight",
+            "topological_phase": "topological_phase_weight",
+            "spacetime_micro": "spacetime_micro_weight",
+            "quantum_field_coherence": "quantum_field_weight",
+            "Negative Energy Pockets": "energy_weight",
+            "Gauge Invariant Alignment": "gauge_weight",
+            "Ads Boundary Detector": "ads_weight",
+            "Decoherence Filter": "decoherence_weight",
+        }
+
+
+        for name, metric in component_map.items():
+            multiplier = feedback.get(name)
+            if multiplier is None:
+                continue
+            current = getattr(self.params, metric)
+            setattr(self.params, metric, current * multiplier)
+
+
+        self._gate_components(attribution, scoreboard)
+        self.enforce_feature_constraints()
+    def calculate_returns(self, prices: np.ndarray) -> np.ndarray:
+        return np.diff(np.log(prices))
+
+
+    def calculate_reference_price(self, prices: np.ndarray) -> np.ndarray:
+        if len(prices) < self.params.reference_window:
+            return np.full_like(prices, prices[0])
+        ref_prices = np.convolve(
+            prices,
+            np.ones(self.params.reference_window) / self.params.reference_window,
+            mode="same",
+        )
+        ref_prices[: self.params.reference_window // 2] = ref_prices[
+            self.params.reference_window // 2
+        ]
+        ref_prices[-self.params.reference_window // 2 :] = ref_prices[
+            -self.params.reference_window // 2 - 1
+        ]
+        return ref_prices
+
+
+    def calculate_market_state(self, prices: np.ndarray) -> np.ndarray:
+        ref_prices = self.calculate_reference_price(prices)
+        return (prices - ref_prices) / ref_prices
+
+
+    def calculate_curvature(self, prices: np.ndarray) -> np.ndarray:
+        if len(prices) < 3:
+            return np.zeros_like(prices)
+        first_derivative = np.diff(prices)
+        second_derivative = np.diff(first_derivative)
+        second_derivative = np.pad(second_derivative, (1, 1), mode="edge")
+        non_zero_prices = np.where(prices != 0, prices, 1e-10)
+        curvature = np.zeros_like(prices)
+        curvature[1:-1] = second_derivative[1:-1] / non_zero_prices[1:-1]
+        return curvature
+
+
+    def calculate_renormalized_stress(self, prices: np.ndarray) -> np.ndarray:
+        returns = self.calculate_returns(np.concatenate([[prices[0]], prices]))
+        volatility = _rolling_std(returns, self.params.volatility_window)
+        if len(volatility) < len(prices):
+            volatility = np.pad(volatility, (0, len(prices) - len(volatility)), mode="edge")
+        ref_stress = np.mean(volatility)
+        return volatility - ref_stress
+
+
+    def calculate_alpha_signal(self, prices: np.ndarray) -> np.ndarray:
+        return -self.calculate_market_state(prices)
+
+
+    def calculate_position_size(self, prices: np.ndarray) -> np.ndarray:
+        curvature = self.calculate_curvature(prices)
+        abs_curvature = np.abs(curvature)
+        threshold = max(self.params.curvature_threshold, 1e-10)
+        position_size = self.params.base_position_size / (1 + abs_curvature / threshold)
+        position_size = np.minimum(position_size, self.params.max_position_size)
+        return position_size
+
+
+    # --- Lorentz-style event normalization -----------------------------
+    def time_dilated_event_flow(
+        self, prices: np.ndarray, event_flow: np.ndarray, volumes: Optional[np.ndarray] = None
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Normalize event flow into pseudo-proper time to highlight compression/dilation."""
+
+
+        if len(event_flow) == 0:
+            return event_flow, np.ones_like(event_flow)
+
+
+        returns = self.calculate_returns(np.concatenate([[prices[0]], prices]))
+        velocity = np.abs(returns[: len(event_flow)])
+        if volumes is not None:
+            velocity *= 1 + np.abs(volumes[: len(velocity)]) / (np.mean(volumes) + 1e-6)
+        c = max(np.percentile(velocity, 95), 1e-6) * self.params.speed_of_light_scale
+        v_over_c = np.clip(velocity / c, 0, 0.99)
+        gamma = 1.0 / np.sqrt(1 - v_over_c**2)
+        tau = np.cumsum(gamma)
+        tau = tau - tau[0]
+        normalized_tau = tau / (tau[-1] + 1e-9)
+        aligned_flow = np.interp(np.linspace(0, 1, len(event_flow)), normalized_tau, event_flow)
+        dilation_signal = np.gradient(aligned_flow) * self.params.time_dilation_weight
+        return aligned_flow, dilation_signal
+
+
+    # --- physics-inspired signals --------------------------------------
+    def metric_drift(self, lob_snapshots: Sequence[np.ndarray]) -> np.ndarray:
+        metrics = [
+            assemble_metric_tensor(snapshot, self.params.metric_regularization)
+            for snapshot in lob_snapshots
+        ]
+        smoothed = smooth_metric(metrics, self.params.metric_smoothing_iterations)
+        drift = np.zeros(len(smoothed))
+        for i in range(1, len(smoothed)):
+            prev = smoothed[i - 1]
+            curr = smoothed[i]
+            drift[i] = np.linalg.norm(curr[1:, 1:] - prev[1:, 1:], ord="fro")
+        return drift
+
+
+    def lambda_resonant_kernel(self, series: np.ndarray, lam: float) -> np.ndarray:
+        kernel = np.exp(-lam * np.arange(len(series)))
+        conv = np.convolve(series, kernel, mode="full")[: len(series)]
+        return conv / (np.linalg.norm(kernel) + 1e-9)
+
+
+    def detect_echoes(self, event_flow: np.ndarray) -> np.ndarray:
+        lam = max(self.lambda_scale, 1e-4)
+        memory = self.lambda_resonant_kernel(event_flow, lam)
+        echo_signal = np.gradient(memory)
+        return echo_signal
+
+
+    def negative_energy_pockets(
+        self,
+        liquidity: np.ndarray,
+        spreads: np.ndarray,
+        event_flow: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        rho_eff = liquidity - np.minimum.accumulate(liquidity)
+        baseline = _ewm_mean(rho_eff, self.params.pocket_baseline_window)
+        energy = rho_eff - baseline
+
+
+        localized_curvature = np.gradient(np.gradient(energy))
+        localized_signal = -np.tanh(localized_curvature)
+
+
+        volume_grad = np.gradient(liquidity)
+        volume_shock = np.tanh(np.gradient(volume_grad))
+        if event_flow is not None and len(event_flow):
+            flow_grad = np.gradient(event_flow[: len(volume_shock)])
+            flow_z = flow_grad / (np.std(flow_grad) + 1e-6)
+            volume_shock[: len(flow_z)] += np.tanh(flow_z)
+
+
+        scaled = (
+            energy
+            - self.params.negative_energy_lambda * np.std(energy)
+            + 0.35 * localized_signal
+            + 0.25 * volume_shock
+        )
+        return scaled
+
+
+    def rg_flow_update(self, series: np.ndarray) -> float:
+        variance = float(np.var(series))
+        error = variance - self.params.rg_target_variance
+        self.lambda_scale -= self.params.rg_learning_rate * error
+        self.lambda_scale *= self.params.rg_damping
+        self.lambda_scale = max(self.lambda_scale, 1e-4)
+        return self.lambda_scale
+
+
+    def warp_wall_gradient(self, liquidity_profile: np.ndarray, price_grid: np.ndarray) -> np.ndarray:
+        grad = np.gradient(liquidity_profile, price_grid)
+        curvature = np.gradient(grad, price_grid)
+        sigma = 1 / (np.abs(curvature) + 1e-6)
+        sigma_norm = sigma / (np.max(sigma) + 1e-6)
+        return sigma_norm
+
+
+    def entanglement_surface(self, instrument_prices: Dict[str, np.ndarray]) -> np.ndarray:
+        """Estimate cross-instrument curvature coupling surface."""
+
+
+        if len(instrument_prices) < 2:
+            if not instrument_prices:
+                return np.array([])
+            return np.zeros_like(next(iter(instrument_prices.values())))
+
+
+        curvatures = {k: self.calculate_curvature(v) for k, v in instrument_prices.items()}
+        min_len = min(len(c) for c in curvatures.values())
+        coupling = np.zeros(min_len)
+        keys = list(curvatures.keys())
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                ci = curvatures[keys[i]][:min_len]
+                cj = curvatures[keys[j]][:min_len]
+                coupling += ci * cj - np.mean(ci) * np.mean(cj)
+        pair_count = max(len(keys) * (len(keys) - 1) / 2, 1)
+        return coupling / pair_count
+
+
+    def topological_shock_detector(
+        self, prices: np.ndarray, liquidity_profile: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Detect topology-like ruptures using price gaps and liquidity holes."""
+
+
+        gaps = np.abs(np.diff(prices))
+        gap_threshold = np.std(gaps) * self.params.shock_threshold_std + 1e-9
+        gap_flags = np.concatenate([[0], (gaps > gap_threshold).astype(float)])
+
+
+        hole_flags = np.zeros_like(gap_flags, dtype=float)
+        if liquidity_profile is not None and len(liquidity_profile) > 2:
+            grad = np.gradient(liquidity_profile)
+            curvature = np.gradient(grad)
+            holes = (np.diff(np.sign(curvature)) != 0).astype(float)
+            hole_flags = np.pad(holes, (1, max(0, len(gap_flags) - len(holes) - 1)), "edge")[: len(gap_flags)]
+
+
+        return gap_flags + hole_flags
+
+
+    def curvature_cascade(self, prices: np.ndarray) -> np.ndarray:
+        """Compute multi-resolution curvature cascade energy."""
+
+
+        cascade_energy = np.zeros_like(prices, dtype=float)
+        prev_curvature = self.calculate_curvature(prices)
+        for level in range(1, self.params.cascade_levels + 1):
+            step = 2**level
+            coarse_prices = prices[::step]
+            if len(coarse_prices) < 3:
+                break
+            coarse_curvature = self.calculate_curvature(coarse_prices)
+            coarse_interp = np.interp(
+                np.linspace(0, len(coarse_curvature) - 1, num=len(prev_curvature)),
+                np.arange(len(coarse_curvature)),
+                coarse_curvature,
+            )
+            cascade_energy[: len(prev_curvature)] += np.abs(coarse_interp - prev_curvature)
+            prev_curvature = coarse_interp
+        return cascade_energy * self.params.cascade_weight
+
+
+    # --- signal aggregation --------------------------------------------
+    def generate_trading_signal(
+        self,
+        prices: np.ndarray,
+        volumes: Optional[np.ndarray] = None,
+        lob_snapshots: Optional[Sequence[np.ndarray]] = None,
+        event_flow: Optional[np.ndarray] = None,
+        spreads: Optional[np.ndarray] = None,
+        liquidity_profile: Optional[np.ndarray] = None,
+        price_grid: Optional[np.ndarray] = None,
+        instrument_prices: Optional[Dict[str, np.ndarray]] = None,
+        return_embedding: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[Dict[str, np.ndarray]]]:
+        embedding: Dict[str, np.ndarray] = {}
+        self.enforce_feature_constraints()
+
+
+        alpha_signal = self.calculate_alpha_signal(prices)
+        position_size = self.calculate_position_size(prices)
+        curvature = self.calculate_curvature(prices)
+
+
+        embedding["base_alpha"] = alpha_signal.copy()
+        embedding["metric_drift"] = np.zeros_like(alpha_signal)
+        embedding["echo"] = np.zeros_like(alpha_signal)
+        embedding["dilation"] = np.zeros_like(alpha_signal)
+        embedding["negative_energy"] = np.zeros_like(alpha_signal)
+        embedding["warp_shock"] = np.zeros_like(alpha_signal)
+        embedding["entanglement"] = np.zeros_like(alpha_signal)
+        embedding["cascade_energy"] = np.zeros_like(alpha_signal)
+        embedding["topo_shock"] = np.zeros_like(alpha_signal)
+        embedding["geodesic"] = np.zeros_like(alpha_signal)
+        embedding["tensor_rg"] = np.zeros_like(alpha_signal)
+        embedding["quantum_potential"] = np.zeros_like(alpha_signal)
+        embedding["phase_space"] = np.zeros_like(alpha_signal)
+        embedding["entropy_current"] = np.zeros_like(alpha_signal)
+        embedding["torsion"] = np.zeros_like(alpha_signal)
+        embedding["holographic"] = np.zeros_like(alpha_signal)
+        embedding["info_renorm"] = np.zeros_like(alpha_signal)
+        embedding["anisotropic_stress"] = np.zeros_like(alpha_signal)
+        embedding["qemb"] = np.zeros_like(alpha_signal)
+        embedding["dual_time"] = np.zeros_like(alpha_signal)
+        embedding["topo_flow"] = np.zeros_like(alpha_signal)
+        embedding["phase_transition"] = np.zeros_like(alpha_signal)
+        embedding["energy_dissipation"] = np.zeros_like(alpha_signal)
+        embedding["hamiltonian_surface"] = np.zeros_like(alpha_signal)
+        embedding["gauge_invariant"] = np.zeros_like(alpha_signal)
+        embedding["noether_symmetry"] = np.zeros_like(alpha_signal)
+        embedding["decoherence_filter"] = np.zeros_like(alpha_signal)
+        embedding["ads_boundary"] = np.zeros_like(alpha_signal)
+        embedding["adiabatic_gate"] = np.zeros_like(alpha_signal)
+        embedding["topological_phase"] = np.zeros_like(alpha_signal)
+        embedding["spacetime_micro"] = np.zeros_like(alpha_signal)
+        embedding["quantum_field_coherence"] = np.zeros_like(alpha_signal)
+
+
+        topo_flow = topological_flow_signature(
+            prices,
+            volumes,
+            window=self.params.tda_window,
+            radius_scale=self.params.tda_radius_scale,
+            weight=self.params.tda_weight,
+        )
+        embedding["topo_flow"][: len(topo_flow)] = topo_flow
+
+
+        phase_gate = ising_phase_transition(
+            prices,
+            window=self.params.phase_transition_window,
+            threshold=self.params.phase_transition_threshold,
+            weight=self.params.phase_transition_weight,
+        )
+        embedding["phase_transition"][: len(phase_gate)] = phase_gate
+
+
+        if len(phase_gate):
+            gate_scale = 1 - 0.5 * np.clip(phase_gate, 0, 1)
+            position_size[: len(gate_scale)] *= gate_scale
+
+
+        adiabatic = adiabatic_invariant_gate(
+            prices, window=self.params.volatility_window, weight=self.params.adiabatic_weight
+        )
+        if len(adiabatic):
+            adiabatic_gate = 1 + np.clip(adiabatic, -0.4, 0.4)
+            position_size[: len(adiabatic_gate)] *= adiabatic_gate
+            embedding["adiabatic_gate"][: len(adiabatic)] = adiabatic
+
+
+        topo_phase, topo_regulator = topological_phase_embedding(
+            prices,
+            volumes,
+            weight=self.params.topological_phase_weight,
+            chern_weight=self.params.chern_weight,
+            euler_weight=self.params.euler_weight,
+        )
+        embedding["topological_phase"][: len(topo_phase)] = topo_phase
+        alpha_signal[: len(topo_phase)] += topo_phase
+        if len(topo_regulator):
+            position_size[: len(topo_regulator)] *= topo_regulator
+
+
+        if lob_snapshots:
+            drift = self.metric_drift(lob_snapshots)
+            drift_norm = drift / (np.max(drift) + 1e-6)
+            topo_factor = 1 + topo_flow[: len(drift_norm)] if len(topo_flow) else 1
+            drift_contrib = -drift_norm * topo_factor
+            embedding["metric_drift"][: len(drift_norm)] = drift_contrib
+            alpha_signal[: len(drift_norm)] += drift_contrib
+
+
+            geo_action = geodesic_flow_action(
+                lob_snapshots,
+                self.params.metric_regularization,
+                self.params.metric_smoothing_iterations,
+            )
+            geodesic_contrib = -geo_action * self.params.geodesic_weight
+            embedding["geodesic"][: len(geodesic_contrib)] = geodesic_contrib
+            alpha_signal[: len(geodesic_contrib)] += geodesic_contrib
+
+
+            holo = holographic_depth_reweighting(lob_snapshots)
+            holo_scaled = holo * self.params.holographic_weight
+            embedding["holographic"][: len(holo_scaled)] = holo_scaled
+            alpha_signal[: len(holo_scaled)] += holo_scaled
+
+
+        if event_flow is not None:
+            aligned_flow, dilation = self.time_dilated_event_flow(prices, event_flow, volumes)
+            echoes = self.detect_echoes(aligned_flow)
+            echo_gate = 1 + np.clip(phase_gate[: len(echoes)], 0, 1) if len(phase_gate) else 1
+            gated_echoes = echoes * echo_gate
+            embedding["echo"][: len(echoes)] = gated_echoes
+            embedding["dilation"][: len(dilation)] = dilation
+            alpha_signal[: len(echoes)] += gated_echoes
+            alpha_signal[: len(dilation)] += dilation
+
+
+            qemb = quantum_entropic_memory(
+                event_flow,
+                window=self.params.qemb_window,
+                decay=self.params.qemb_decay,
+                weight=self.params.qemb_weight,
+            )
+            embedding["qemb"][: len(qemb)] = qemb
+            alpha_signal[: len(qemb)] += qemb
+
+
+            dual_time = dual_space_time_embedding(event_flow, self.params.dual_time_weight)
+            embedding["dual_time"][: len(dual_time)] = dual_time
+            alpha_signal[: len(dual_time)] += dual_time
+
+
+        neg_energy_addition: Optional[np.ndarray] = None
+        if spreads is not None and volumes is not None:
+            neg_energy = self.negative_energy_pockets(volumes, spreads, event_flow)
+            addition = np.tanh(neg_energy)
+            embedding["negative_energy"][: len(addition)] = addition
+            neg_energy_addition = addition
+
+
+        if liquidity_profile is not None and price_grid is not None:
+            warp_sigma = self.warp_wall_gradient(liquidity_profile, price_grid)
+            shock = warp_sigma > (1 - self.params.warp_wall_threshold)
+            warp_contrib = -shock.astype(float) * self.params.warp_sigma_sensitivity
+            embedding["warp_shock"][: len(warp_sigma)] = warp_contrib
+            alpha_signal[: len(warp_sigma)] += warp_contrib
+
+
+        micro_curv = spacetime_microstructure_curvature(
+            prices,
+            volumes,
+            spreads,
+            event_flow,
+            weight=self.params.spacetime_micro_weight,
+        )
+        embedding["spacetime_micro"][: len(micro_curv)] = micro_curv
+        alpha_signal[: len(micro_curv)] += micro_curv
+
+
+        if instrument_prices:
+            ent_surface = self.entanglement_surface(instrument_prices)
+            ent_contrib = ent_surface * self.params.entanglement_weight
+            embedding["entanglement"][: len(ent_surface)] = ent_contrib
+            alpha_signal[: len(ent_surface)] += ent_contrib
+
+
+            field_coherence = quantum_field_coherence(
+                instrument_prices, weight=self.params.quantum_field_weight
+            )
+            embedding["quantum_field_coherence"][: len(field_coherence)] = field_coherence
+            alpha_signal[: len(field_coherence)] += field_coherence
+
+
+            if neg_energy_addition is not None:
+                cross_vacuum = np.tanh(np.maximum(-ent_surface[: len(neg_energy_addition)], 0))
+                gated_neg_energy = neg_energy_addition.copy()
+                gated_neg_energy[: len(cross_vacuum)] *= 1 + cross_vacuum
+                embedding["negative_energy"][: len(gated_neg_energy)] = gated_neg_energy
+                alpha_signal[: len(gated_neg_energy)] += gated_neg_energy
+        
+        if neg_energy_addition is not None and not instrument_prices:
+            alpha_signal[: len(neg_energy_addition)] += neg_energy_addition
+
+
+        cascade_energy = self.curvature_cascade(prices)
+        embedding["cascade_energy"][: len(cascade_energy)] = cascade_energy
+        alpha_signal[: len(cascade_energy)] += cascade_energy
+
+
+        tensor_rg = tensor_field_renormalization(curvature, levels=self.params.cascade_levels)
+        tensor_rg_scaled = tensor_rg * self.params.tensor_rg_weight
+        embedding["tensor_rg"][: len(tensor_rg_scaled)] = tensor_rg_scaled
+        alpha_signal[: len(tensor_rg_scaled)] += tensor_rg_scaled
+
+
+        torsion = torsion_tensor(prices, volumes)
+        torsion_scaled = torsion * self.params.torsion_weight
+        embedding["torsion"][: len(torsion_scaled)] = torsion_scaled
+        alpha_signal[: len(torsion_scaled)] += torsion_scaled
+
+
+        shocks = self.topological_shock_detector(prices, liquidity_profile)
+        embedding["topo_shock"][: len(shocks)] = -shocks
+        alpha_signal[: len(shocks)] -= shocks
+
+
+        energy_flow = energy_dissipation_flow(
+            prices,
+            volumes,
+            event_flow,
+            window=self.params.energy_window,
+            weight=self.params.energy_weight,
+        )
+        embedding["energy_dissipation"][: len(energy_flow)] = energy_flow
+
+
+        quantum_potential = quantum_potential_proxy(prices, bins=self.params.quantum_bins)
+        qp_scaled = np.tanh(quantum_potential) * self.params.quantum_potential_weight
+        if len(energy_flow):
+            qp_scaled[: len(energy_flow)] += 0.5 * energy_flow
+        embedding["quantum_potential"][: len(qp_scaled)] = qp_scaled
+        alpha_signal[: len(qp_scaled)] += qp_scaled
+
+
+        if len(energy_flow):
+            alpha_signal[: len(energy_flow)] += energy_flow
+
+
+        phase_curv = phase_space_curvature(prices) * self.params.phase_space_weight
+        embedding["phase_space"][: len(phase_curv)] = phase_curv
+        alpha_signal[: len(phase_curv)] += phase_curv
+
+
+        entropy_flux = entropy_current(volumes, spreads, event_flow, self.params.entropy_window)
+        if len(entropy_flux):
+            entropy_scaled = entropy_flux * self.params.entropy_current_weight
+            embedding["entropy_current"][: len(entropy_scaled)] = entropy_scaled
+            alpha_signal[: len(entropy_scaled)] += entropy_scaled
+
+
+        h_surface = hamiltonian_energy_surface(
+            prices, window=self.params.hamiltonian_window, weight=self.params.hamiltonian_weight
+        )
+        embedding["hamiltonian_surface"][: len(h_surface)] = h_surface
+        alpha_signal[: len(h_surface)] += h_surface
+
+
+        gauge = gauge_invariant_alignment(
+            prices,
+            self.params.gauge_window,
+            self.params.gauge_weight,
+            clip_value=self.params.gauge_clip,
+            reg_epsilon=self.params.gauge_reg_epsilon,
+        )
+        embedding["gauge_invariant"][: len(gauge)] = gauge
+        alpha_signal[: len(gauge)] += gauge
+
+
+        noether = noether_symmetry_tracker(
+            prices, volumes, self.params.noether_window, self.params.noether_weight
+        )
+        embedding["noether_symmetry"][: len(noether)] = noether
+        alpha_signal[: len(noether)] += noether
+
+
+        deco = quantum_decoherence_filter(
+            prices, event_flow, self.params.decoherence_window, self.params.decoherence_weight
+        )
+        embedding["decoherence_filter"][: len(deco)] = deco
+        alpha_signal[: len(deco)] += deco
+
+
+        ads_boundary = ads_cft_boundary_detector(
+            prices, self.params.ads_window, self.params.ads_weight
+        )
+        embedding["ads_boundary"][: len(ads_boundary)] = ads_boundary
+        alpha_signal[: len(ads_boundary)] += ads_boundary
+
+
+        info_renorm = information_theoretic_renorm(
+            prices,
+            window=self.params.volatility_window,
+            baseline_window=self.params.info_baseline_window,
+            weight=self.params.info_renorm_weight,
+        )
+        embedding["info_renorm"][: len(info_renorm)] = info_renorm
+        alpha_signal[: len(info_renorm)] += info_renorm
+
+
+        anisotropic = anisotropic_stress_field(
+            instrument_prices, window=self.params.anisotropic_window, weight=self.params.anisotropic_weight
+        )
+        embedding["anisotropic_stress"][: len(anisotropic)] = anisotropic
+        alpha_signal[: len(anisotropic)] += anisotropic
+
+
+        embedding["pre_rg_alpha"] = alpha_signal.copy()
+
+
+        renorm_stress = self.calculate_renormalized_stress(prices)
+        self.rg_flow_update(renorm_stress)
+        rg_multiplier = 1.0 + np.clip(self.lambda_scale, 0, 1)
+        alpha_signal *= rg_multiplier
+        embedding["rg_multiplier"] = rg_multiplier
+
+
+        final_signal = alpha_signal * position_size
+        self.signal_history.append(final_signal[-1] if len(final_signal) else 0.0)
+        self.position_history.append(position_size[-1] if len(position_size) else 0.0)
+        self.curvature_history.append(curvature[-1] if len(curvature) else 0.0)
+
+
+        if return_embedding:
+            embedding["final_signal"] = final_signal
+            embedding["position_size"] = position_size
+            return final_signal, position_size, curvature, embedding
+
+
+        return final_signal, position_size, curvature, None
+
+
+    # --- backtesting and training --------------------------------------
+    def backtest(self, prices: np.ndarray, signals: np.ndarray, cfg: TrainingConfig) -> BacktestResult:
+        signals = np.nan_to_num(signals, nan=0.0, posinf=0.0, neginf=0.0)
+        pnl = 0.0
+        equity = [0.0]
+        trades = 0
+        rets = []
+        dt = max(self.params.symplectic_dt, 1e-3)
+        prev_pos = signals[0] if len(signals) else 0.0
+        for i in range(1, len(prices) - cfg.lookahead):
+            pos = signals[i]
+            mid_pos = 0.5 * (prev_pos + pos)
+            price_move = prices[i + cfg.lookahead] - prices[i]
+            trade_cost = cfg.transaction_cost * abs(pos - prev_pos)
+            ret = mid_pos * price_move * dt - trade_cost
+            rets.append(ret)
+            pnl += ret
+            trades += pos != 0 or prev_pos != 0
+            equity.append(pnl)
+            prev_pos = pos
+        returns_arr = np.array(rets)
+        sharpe = returns_arr.mean() / (returns_arr.std() + 1e-9) * math.sqrt(252)
+        hit_rate = float(np.mean(returns_arr > 0)) if len(returns_arr) else 0.0
+        return BacktestResult(pnl, returns_arr, np.array(equity), sharpe, trades, hit_rate)
+
+
+    def train_strategy(
+        self,
+        prices: np.ndarray,
+        volumes: np.ndarray,
+        lob_snapshots: Sequence[np.ndarray],
+        event_flow: np.ndarray,
+        spreads: np.ndarray,
+        cfg: TrainingConfig,
+        sandbox: Optional[PaperTradingEnvironment] = None,
+    ) -> Dict[str, float]:
+        np.random.seed(cfg.seed)
+        self.enforce_feature_constraints()
+
+
+        def _evaluate_current_params() -> float:
+            fold_scores = []
+            fold_dd = []
+            total_len = len(prices)
+            fold_size = max(32, total_len // max(cfg.cv_folds, 1))
+
+
+            for fold in range(cfg.cv_folds):
+                start = fold * fold_size
+                end = min(total_len, start + fold_size)
+                if end - start < 16:
+                    break
+
+
+                sigs, _, _, _ = self.generate_trading_signal(
+                    prices[start:end],
+                    volumes=volumes[start:end],
+                    lob_snapshots=lob_snapshots[start:end],
+                    event_flow=event_flow[start:end],
+                    spreads=spreads[start:end],
+                )
+                bt = self.backtest(prices[start:end], sigs, cfg)
+                if cfg.optimize_metric.lower() == "calmar":
+                    score = _calmar_ratio(bt.returns, bt.equity_curve)
+                else:
+                    score = _sortino_ratio(bt.returns)
+                dd = abs(_max_drawdown(bt.equity_curve))
+                fold_scores.append(score)
+                fold_dd.append(dd)
+
+
+            if not fold_scores:
+                return -np.inf
+
+
+            avg_score = float(np.mean(fold_scores))
+            avg_dd = float(np.mean(fold_dd))
+            return avg_score - cfg.drawdown_penalty * avg_dd
+
+
+        def _assign_params(params: Dict[str, float]) -> None:
+            for key, value in params.items():
+                setattr(self.params, key, value)
+
+
+        best_params: Dict[str, float] = {}
+        best_objective = -np.inf
+
+
+        if optuna is None:
+            for _ in range(cfg.optimize_trials):
+                candidate = {
+                    "relaxation_constant": float(np.random.uniform(0.02, 0.3)),
+                    "curvature_threshold": float(np.random.uniform(0.0003, 0.005)),
+                    "lambda_resonance": float(np.random.uniform(0.15, 0.65)),
+                    "base_position_size": float(np.random.uniform(0.5, 2.5)),
+                    "rg_learning_rate": float(np.random.uniform(0.01, 0.08)),
+                    "metric_regularization": float(np.exp(np.random.uniform(np.log(1e-5), np.log(1e-2)))),
+                    "warp_wall_threshold": float(np.random.uniform(0.4, 0.85)),
+                    "entanglement_weight": float(np.random.uniform(0.1, 0.7)),
+                    "quantum_potential_weight": float(np.random.uniform(0.1, 0.6)),
+                    "torsion_weight": float(np.random.uniform(0.05, 0.5)),
+                    "holographic_weight": float(np.random.uniform(0.1, 0.6)),
+                    "phase_transition_weight": float(np.random.uniform(0.1, 0.6)),
+                    "decoherence_weight": float(np.random.uniform(0.0, 0.1)),
+                    "gauge_weight": float(np.random.uniform(0.95, 1.2)),
+                    "noether_weight": float(np.random.uniform(0.95, 1.2)),
+                    "ads_weight": float(np.random.uniform(0.0, 0.1)),
+                    "energy_weight": float(np.random.uniform(0.0, 0.1)),
+                    "quantum_field_weight": float(np.random.uniform(0.95, 1.2)),
+                    "adiabatic_weight": float(np.random.uniform(0.0, 0.1)),
+                    "topological_phase_weight": float(np.random.uniform(0.0, 0.1)),
+                    "spacetime_micro_weight": float(np.random.uniform(0.95, 1.2)),
+                    "chern_weight": float(np.random.uniform(0.05, 0.4)),
+                    "euler_weight": float(np.random.uniform(0.05, 0.3)),
+                }
+                _assign_params(candidate)
+                value = _evaluate_current_params()
+                if value > best_objective:
+                    best_objective = value
+                    best_params = candidate
+        else:
+            def _objective(trial: optuna.trial.Trial) -> float:
+                sampled = {
+                    "relaxation_constant": trial.suggest_float("relaxation_constant", 0.02, 0.3),
+                    "curvature_threshold": trial.suggest_float("curvature_threshold", 0.0003, 0.005),
+                    "lambda_resonance": trial.suggest_float("lambda_resonance", 0.15, 0.65),
+                    "base_position_size": trial.suggest_float("base_position_size", 0.5, 2.5),
+                    "rg_learning_rate": trial.suggest_float("rg_learning_rate", 0.01, 0.08),
+                    "metric_regularization": trial.suggest_float(
+                        "metric_regularization", 1e-5, 1e-2, log=True
+                    ),
+                    "warp_wall_threshold": trial.suggest_float("warp_wall_threshold", 0.4, 0.85),
+                    "entanglement_weight": trial.suggest_float("entanglement_weight", 0.1, 0.7),
+                    "quantum_potential_weight": trial.suggest_float(
+                        "quantum_potential_weight", 0.1, 0.6
+                    ),
+                    "torsion_weight": trial.suggest_float("torsion_weight", 0.05, 0.5),
+                    "holographic_weight": trial.suggest_float("holographic_weight", 0.1, 0.6),
+                    "phase_transition_weight": trial.suggest_float("phase_transition_weight", 0.1, 0.6),
+                    "decoherence_weight": trial.suggest_float("decoherence_weight", 0.0, 0.1),
+                    "gauge_weight": trial.suggest_float("gauge_weight", 0.95, 1.2),
+                    "noether_weight": trial.suggest_float("noether_weight", 0.95, 1.2),
+                    "ads_weight": trial.suggest_float("ads_weight", 0.0, 0.1),
+                    "energy_weight": trial.suggest_float("energy_weight", 0.0, 0.1),
+                    "quantum_field_weight": trial.suggest_float("quantum_field_weight", 0.95, 1.2),
+                    "adiabatic_weight": trial.suggest_float("adiabatic_weight", 0.0, 0.1),
+                    "topological_phase_weight": trial.suggest_float("topological_phase_weight", 0.0, 0.1),
+                    "spacetime_micro_weight": trial.suggest_float("spacetime_micro_weight", 0.95, 1.2),
+                    "chern_weight": trial.suggest_float("chern_weight", 0.05, 0.4),
+                    "euler_weight": trial.suggest_float("euler_weight", 0.05, 0.3),
+                }
+                _assign_params(sampled)
+                value = _evaluate_current_params()
+                return value
+
+
+            study = optuna.create_study(
+                direction="maximize", sampler=optuna.samplers.TPESampler(seed=cfg.seed)
+            )
+            study.optimize(_objective, n_trials=cfg.optimize_trials, show_progress_bar=False)
+            best_params = {k: float(v) for k, v in study.best_trial.params.items()}
+            best_objective = float(study.best_trial.value)
+
+
+        _assign_params(best_params)
+
+
+        if sandbox is not None:
+            sandbox.reset()
+            signals, _, _, _ = self.generate_trading_signal(
+                prices,
+                volumes=volumes,
+                lob_snapshots=lob_snapshots,
+                event_flow=event_flow,
+                spreads=spreads,
+            )
+            for idx, (price, sig) in enumerate(zip(prices, signals)):
+                sandbox.step(price=price, target_position=sig, step_idx=idx)
+
+
+        return {
+            **best_params,
+            "objective": best_objective,
+            "opt_metric": cfg.optimize_metric,
+            "drawdown_penalty": cfg.drawdown_penalty,
+            "optimizer": "optuna" if optuna is not None else "random_search",
+        }
+
+
+    def sharpe_feedback_allocation(
+        self,
+        base: BacktestResult,
+        attribution: Dict[str, Dict[str, float]],
+        scoreboard: Dict[str, Dict[str, float]],
+    ) -> Dict[str, float]:
+        adjustments: Dict[str, float] = {}
+        lr = self.params.sharpe_feedback_lr
+        floor = self.params.sharpe_component_floor
+
+
+        def _score_entry(entry: Dict[str, float]) -> float:
+            return entry.get("delta_sharpe", 0.0) - 0.5 * abs(entry.get("max_dd", 0.0)) + 0.25 * entry.get("hit_rate", 0.0)
+
+
+        merged: Dict[str, Dict[str, float]] = {}
+        merged.update(attribution)
+        merged.update({k: v for k, v in scoreboard.items()})
+        for key, stats in merged.items():
+            score = _score_entry(stats)
+            multiplier = max(floor, 1 + lr * score)
+            adjustments[key] = multiplier
+
+
+        adjustments["base_sharpe"] = base.sharpe
+        return adjustments
+
+
+    def backtest_with_embeddings(
+        self,
+        prices: np.ndarray,
+        volumes: Optional[np.ndarray],
+        lob_snapshots: Optional[Sequence[np.ndarray]],
+        event_flow: Optional[np.ndarray],
+        spreads: Optional[np.ndarray],
+        cfg: TrainingConfig,
+        liquidity_profile: Optional[np.ndarray] = None,
+        price_grid: Optional[np.ndarray] = None,
+        instrument_prices: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Tuple[
+        Dict[str, BacktestResult],
+        Dict[str, Dict[str, float]],
+        Dict[str, Dict[str, float]],
+        Dict[str, float],
+    ]:
+        signals, position_size, _, embedding = self.generate_trading_signal(
+            prices,
+            volumes=volumes,
+            lob_snapshots=lob_snapshots,
+            event_flow=event_flow,
+            spreads=spreads,
+            liquidity_profile=liquidity_profile,
+            price_grid=price_grid,
+            instrument_prices=instrument_prices,
+            return_embedding=True,
+        )
+
+
+        assert embedding is not None  # for type checkers
+
+
+        base_signal = embedding["base_alpha"] * position_size
+        pre_rg_signal = embedding["pre_rg_alpha"] * position_size
+
+
+        base_bt = self.backtest(prices, base_signal, cfg)
+
+
+        results = {
+            "full_stack": self.backtest(prices, signals, cfg),
+            "base_alpha": base_bt,
+            "physics_pre_rg": self.backtest(prices, pre_rg_signal, cfg),
+        }
+
+
+        attribution: Dict[str, Dict[str, float]] = {}
+        component_targets = [
+            "hamiltonian_surface",
+            "gauge_invariant",
+            "noether_symmetry",
+            "decoherence_filter",
+            "ads_boundary",
+            "adiabatic_gate",
+            "topological_phase",
+            "spacetime_micro",
+            "quantum_field_coherence",
+        ]
+        for comp in component_targets:
+            if comp not in embedding:
+                continue
+            comp_signal = (embedding["base_alpha"] + embedding[comp]) * position_size
+            comp_bt = self.backtest(prices, comp_signal, cfg)
+            attribution[comp] = {
+                "delta_sharpe": comp_bt.sharpe - base_bt.sharpe,
+                "sharpe": comp_bt.sharpe,
+                "hit_rate": comp_bt.hit_rate,
+                "max_dd": _max_drawdown(comp_bt.equity_curve),
+            }
+            results[comp] = comp_bt
+
+
+        scoreboard_mapping = {
+            "Negative Energy Pockets": "negative_energy",
+            "Decoherence Filter": "decoherence_filter",
+            "Gauge Invariant Alignment": "gauge_invariant",
+            "Ads Boundary Detector": "ads_boundary",
+        }
+        scoreboard: Dict[str, Dict[str, float]] = {}
+        for label, key in scoreboard_mapping.items():
+            if key not in embedding:
+                continue
+            signal = (embedding["base_alpha"] + embedding[key]) * position_size
+            comp_bt = self.backtest(prices, signal, cfg)
+            scoreboard[label] = {
+                "delta_sharpe": comp_bt.sharpe - base_bt.sharpe,
+                "hit_rate": comp_bt.hit_rate,
+                "max_dd": _max_drawdown(comp_bt.equity_curve),
+            }
+
+
+        feedback = self.sharpe_feedback_allocation(base_bt, attribution, scoreboard)
+
+
+        return results, attribution, scoreboard, feedback
+
+
+    def daily_walkforward_backtest(
+        self,
+        prices: np.ndarray,
+        volumes: Optional[np.ndarray],
+        lob_snapshots: Optional[Sequence[np.ndarray]],
+        event_flow: Optional[np.ndarray],
+        spreads: Optional[np.ndarray],
+        cfg: TrainingConfig,
+        liquidity_profile: Optional[np.ndarray] = None,
+        price_grid: Optional[np.ndarray] = None,
+        instrument_prices: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Tuple[List[Dict[str, float]], List[Dict[str, object]]]:
+        """Run a daily walk-forward backtest over a rolling two-year window."""
+
+
+        window = 252 * cfg.walkforward_years
+        step = max(1, 252 // cfg.walkforward_folds_per_year)
+        fold_results: List[Dict[str, float]] = []
+        weight_audit: List[Dict[str, object]] = []
+
+
+        def _slice(arr: Optional[np.ndarray], s: slice) -> Optional[np.ndarray]:
+            return arr[s] if arr is not None else None
+
+
+        for start in range(0, max(len(prices) - window, 0), step):
+            end = start + window
+            price_slice = prices[start:end]
+            if len(price_slice) < window:
+                break
+            volume_slice = _slice(volumes, slice(start, end)) if volumes is not None else None
+            spread_slice = _slice(spreads, slice(start, end)) if spreads is not None else None
+            flow_slice = _slice(event_flow, slice(start, end)) if event_flow is not None else None
+            lob_slice = lob_snapshots[start:end] if lob_snapshots else None
+            instrument_slice = None
+            if instrument_prices:
+                instrument_slice = {
+                    name: series[start:end] for name, series in instrument_prices.items()
+                }
+
+
+            weights_before = self.snapshot_weights()
+            results, attribution, scoreboard, feedback = self.backtest_with_embeddings(
+                price_slice,
+                volume_slice,
+                lob_slice,
+                flow_slice,
+                spread_slice,
+                cfg,
+                liquidity_profile=liquidity_profile,
+                price_grid=price_grid,
+                instrument_prices=instrument_slice,
+            )
+
+
+            self.apply_feedback_and_gate(feedback, attribution, scoreboard)
+
+
+            fold_results.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "full_sharpe": results["full_stack"].sharpe,
+                    "base_sharpe": results["base_alpha"].sharpe,
+                    "attribution": attribution,
+                    "scoreboard": scoreboard,
+                    "feedback": feedback,
+                }
+            )
+            weight_audit.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "weights_before": weights_before,
+                    "weights_after": self.snapshot_weights(),
+                }
+            )
+
+
+        return fold_results, weight_audit
+
+
+
+
+def _max_drawdown(equity: np.ndarray) -> float:
+    if len(equity) == 0:
+        return 0.0
+    running_max = np.maximum.accumulate(equity)
+    drawdowns = (equity - running_max) / (running_max + 1e-9)
+    return float(drawdowns.min())
+
+
+
+
+def _sortino_ratio(returns: np.ndarray) -> float:
+    if len(returns) == 0:
+        return 0.0
+    downside = returns[returns < 0]
+    downside_std = float(downside.std()) if len(downside) else 0.0
+    if downside_std == 0:
+        return 0.0
+    return float(returns.mean() / (downside_std + 1e-9) * math.sqrt(252))
+
+
+
+
+def _calmar_ratio(returns: np.ndarray, equity: np.ndarray) -> float:
+    if len(returns) == 0 or len(equity) == 0:
+        return 0.0
+    annual_return = float(returns.mean() * 252)
+    max_dd = abs(_max_drawdown(equity))
+    if max_dd == 0:
+        return 0.0
+    return annual_return / (max_dd + 1e-9)
+
+
+
+
+def example_usage() -> None:
+    """Run a quick simulation to demonstrate feature wiring."""
+
+
+    np.random.seed(0)
+    n = 630
+    base_price = 4300.0
+    drift = 0.0001
+    returns = np.random.normal(drift, 0.008, n)
+    prices = base_price * np.exp(np.cumsum(np.insert(returns, 0, 0)))
+
+
+    # Companion instrument for entanglement surface estimation
+    ndx_base = 14700.0
+    ndx_returns = np.random.normal(drift * 1.2, 0.009, n)
+    ndx_prices = ndx_base * np.exp(np.cumsum(np.insert(ndx_returns, 0, 0)))
+
+
+    volumes = np.abs(np.random.normal(1000, 200, n + 1))
+    spreads = np.abs(np.random.normal(1.0, 0.25, n + 1))
+    event_flow = np.random.poisson(5, n + 1) - 4
+
+
+    # Synthetic LOB snapshots: [price_offset, size, side]
+    lob_snapshots = []
+    for i in range(n + 1):
+        offsets = np.linspace(-1, 1, 10)
+        sizes = np.abs(np.random.normal(500, 50, 10))
+        side = np.sign(np.random.normal(0, 1, 10))
+        lob_snapshots.append(np.stack([offsets, sizes, side], axis=1))
+
+
+    liquidity_profile = np.abs(np.random.normal(1000, 200, 25))
+    price_grid = np.linspace(-5, 5, 25)
+
+
+    params = ModelParameters()
+    model = SP500FuturesModel(params)
+    signals, positions, curvature, embedding = model.generate_trading_signal(
+        prices,
+        volumes=volumes,
+        lob_snapshots=lob_snapshots,
+        event_flow=event_flow,
+        spreads=spreads,
+        liquidity_profile=liquidity_profile,
+        price_grid=price_grid,
+        instrument_prices={"ES": prices, "NQ": ndx_prices},
+        return_embedding=True,
+    )
+    # Use a reduced trial count here to keep the example fast; production runs
+    # should leverage the 500–2000 trial range recommended by the optimizer.
+    cfg = TrainingConfig(optimize_trials=12, cv_folds=2, optimize_metric="calmar")
+    bt = model.backtest(prices, signals, cfg)
+    bt_splits, attribution, scoreboard, feedback = model.backtest_with_embeddings(
+        prices,
+        volumes,
+        lob_snapshots,
+        event_flow,
+        spreads,
+        cfg,
+        liquidity_profile=liquidity_profile,
+        price_grid=price_grid,
+        instrument_prices={"ES": prices, "NQ": ndx_prices},
+    )
+
+
+    walk_logs, weight_logs = model.daily_walkforward_backtest(
+        prices,
+        volumes,
+        lob_snapshots,
+        event_flow,
+        spreads,
+        cfg,
+        liquidity_profile=liquidity_profile,
+        price_grid=price_grid,
+        instrument_prices={"ES": prices, "NQ": ndx_prices},
+    )
+
+
+    sandbox = PaperTradingEnvironment(initial_cash=250_000)
+    best = model.train_strategy(
+        prices,
+        volumes,
+        lob_snapshots,
+        event_flow,
+        spreads,
+        cfg,
+        sandbox=sandbox,
+    )
+
+
+    print("Backtest Sharpe:", f"{bt.sharpe:.2f}")
+    print("Backtest PnL:", f"{bt.pnl:.2f}")
+    print(
+        "Embeddings vs strategy Sharpe:",
+        {k: f"{v.sharpe:.2f}" for k, v in bt_splits.items()},
+    )
+    if embedding is not None:
+        keys = [
+            "geodesic",
+            "tensor_rg",
+            "quantum_potential",
+            "phase_space",
+            "entropy_current",
+            "torsion",
+            "holographic",
+            "info_renorm",
+            "anisotropic_stress",
+            "qemb",
+            "dual_time",
+            "topo_flow",
+            "phase_transition",
+            "energy_dissipation",
+            "hamiltonian_surface",
+            "gauge_invariant",
+            "noether_symmetry",
+            "decoherence_filter",
+            "ads_boundary",
+        ]
+        preview = {k: float(np.mean(np.abs(embedding[k]))) for k in keys if k in embedding}
+        print("Physics add-ons mean magnitude:", preview)
+    for split_name, split_bt in bt_splits.items():
+        dd = _max_drawdown(split_bt.equity_curve)
+        print(f"{split_name} trades: {split_bt.trades}, hit_rate: {split_bt.hit_rate:.2f}, maxDD: {dd:.3f}")
+    if attribution:
+        print("Component-wise Sharpe deltas vs base:")
+        for comp, stats in attribution.items():
+            print(
+                f"  {comp}: ΔSharpe={stats['delta_sharpe']:.3f}, "
+                f"Sharpe={stats['sharpe']:.3f}, hit_rate={stats['hit_rate']:.2f}, maxDD={stats['max_dd']:.3f}"
+            )
+    if scoreboard:
+        print("Physics Alpha Scoreboard (vs base):")
+        for label, stats in scoreboard.items():
+            print(
+                f"  {label}: ΔSharpe={stats['delta_sharpe']:.3f}, "
+                f"Hit={stats['hit_rate']:.2f}, MaxDD={stats['max_dd']:.3f}"
+            )
+    if feedback:
+        print("Sharpe-aware feedback multipliers:", feedback)
+    if walk_logs:
+        print("Walk-forward two-year folds (daily step, 3 folds/year):")
+        for log in walk_logs:
+            print(
+                f"  window {log['start']}-{log['end']}: full_sharpe={log['full_sharpe']:.3f}, "
+                f"base_sharpe={log['base_sharpe']:.3f}"
+            )
+            for comp, stats in log["attribution"].items():
+                print(
+                    f"    attr[{comp}]: ΔS={stats['delta_sharpe']:.3f}, "
+                    f"hit={stats['hit_rate']:.2f}, dd={stats['max_dd']:.3f}"
+                )
+            for label, stats in log["scoreboard"].items():
+                print(
+                    f"    scoreboard[{label}]: ΔS={stats['delta_sharpe']:.3f}, "
+                    f"hit={stats['hit_rate']:.2f}, dd={stats['max_dd']:.3f}"
+                )
+            print("    feedback:", log["feedback"])
+    if weight_logs:
+        print("Weight audit snapshots:")
+        for snap in weight_logs:
+            print(
+                f"  {snap['start']}-{snap['end']}: before={snap['weights_before']}, after={snap['weights_after']}"
+            )
+    print("Best params:", best)
+    if sandbox.history:
+        print("Sandbox final value:", sandbox.history[-1].value)
+
+
+
+
+if __name__ == "__main__":
+    example_usage()
