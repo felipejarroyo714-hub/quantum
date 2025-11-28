@@ -1,0 +1,23 @@
+AI Prompt: "Develop a highly accurate 3D+1 warp bubble simulation integrating full general relativistic dynamics coupled with quantum field theory effects. Ensure the simulation computes Einstein field equations dynamically, including the stress-energy tensor contributions from a realistic quantum scalar field."
+
+Directive 1: Implement a tensor-based numerical solver for the Einstein field equations on a 3D spatial plus time grid, using methods such as finite element or spectral approaches suitable for curved spacetime dynamics.
+
+Directive 2: Replace approximate Ricci scalar calculations with full numerical computation of all relevant curvature tensors (Riemann, Ricci, Einstein tensor) consistent with the metric evolution.
+
+Directive 3: Embed a quantum field theory solver for the renormalized stress-energy tensor of the quantum fields, incorporating renormalization techniques and counterterms derived from first principles, avoiding phenomenological approximations.
+
+Directive 4: Integrate Quantum Energy Inequality (QEI) enforcement as hard constraints within the numerical scheme by employing constrained optimization or barrier function methods directly linked to the renormalized stress-energy outputs, with tunable physical parameters grounded in QFT theory.
+
+Directive 5: Use high-order adaptive mesh refinement (AMR) to resolve sharp features of the warp bubble's thick wall, ensuring numerical convergence and stability in regions of strong gradients.
+
+Directive 6: Implement relativistic kinematics fully coupled to the evolving bubble geometry, including tracking the 4-velocity and proper time of the bubble center and surrounding field configurations.
+
+Directive 7: Provide modular, documented APIs and configuration classes for flexible experimentation with parameters such as bubble radius, wall thickness, quantum field coupling constants, and curvature bounds.
+
+Directive 8: Include comprehensive diagnostics including QEI violation rates, conserved adiabatic invariants, spectral decompositions, and multi-scale energy densities with live visualization outputs optimized for large data sets.
+
+Directive 9: Design the code for parallel execution on GPUs or HPC clusters, leveraging frameworks such as CUDA, OpenMP, or MPI to enable resolving fine spatial grids and long-duration simulations efficiently.
+
+Directive 10: Package the entire system with version control, automated testing against analytic solutions or limiting cases, and reproducible result saving/loading to facilitate research transparency and validation.
+
+Final integration note: Combine physics modules with numerical solvers, QFT renormalization, and control algorithms into a single unified simulation framework coded in Python or Julia with performance-critical parts in C++/CUDA, ensuring extensibility for future enhancements and cross-validation with analytical models.
