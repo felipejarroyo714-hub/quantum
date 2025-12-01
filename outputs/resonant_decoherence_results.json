@@ -1,0 +1,24 @@
+{
+  "w_res": 5.322038953548578,
+  "F_noise_only": 0.9359226371520841,
+  "F_res_only": 0.9857368034216714,
+  "F_res_plus_noise": 0.9718215614284273,
+  "F_off_plus_noise": 0.9320461135872723,
+  "params": {
+    "lambda_scale": 1.224744871391589,
+    "num_shells": 20,
+    "nodes_per_shell": 4,
+    "base_radius": 1.0,
+    "t_hop": 1.0,
+    "V0": 5.0,
+    "between_shell_neighbor_factor": 0.45,
+    "within_shell_neighbor_factor": 1.05,
+    "random_seed": 123,
+    "random_rotate_each_shell": true,
+    "drive_eps": 0.2,
+    "noise_eps": 0.1,
+    "noise_tau": 0.2,
+    "T": 20.0,
+    "dt": 0.05
+  }
+}
