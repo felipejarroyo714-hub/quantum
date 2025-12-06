@@ -93,7 +93,21 @@ def integrate_profile(params: GeometryParams) -> Tuple[np.ndarray, np.ndarray, n
 
 # --- Laplace-Beltrami and KG spatial operator ---
 
-def build_kg_operator(z: np.ndarray, r: np.ndarray, R: np.ndarray, field: FieldParams) -> Tuple[diags, np.ndarray]:
+def build_kg_operator(
+    z: np.ndarray,
+    r: np.ndarray,
+    R: np.ndarray,
+    field: FieldParams,
+    anisotropy: np.ndarray | None = None,
+    solvent_attenuation: np.ndarray | None = None,
+) -> Tuple[diags, np.ndarray]:
+    """Construct the KG operator with optional anisotropic couplings.
+
+    ``anisotropy`` modulates the off-diagonal stencil to strengthen propagation
+    along covalent regions; ``solvent_attenuation`` damps the angular component
+    for solvent-exposed regions.
+    """
+
     n = len(z)
     dz = z[1] - z[0]
 
@@ -110,6 +124,11 @@ def build_kg_operator(z: np.ndarray, r: np.ndarray, R: np.ndarray, field: FieldP
     # This yields a symmetric stencil:
     r_mid_plus = 0.5 * (r[1:] + r[:-1])
     r_mid_minus = r_mid_plus
+    if anisotropy is not None and len(anisotropy) >= n:
+        ani = np.asarray(anisotropy, dtype=float)
+        # apply to midpoints for stability
+        r_mid_plus = r_mid_plus * ani[1:]
+        r_mid_minus = r_mid_minus * ani[:-1]
 
     main = np.zeros(n)
     off = np.zeros(n-1)
@@ -134,6 +153,8 @@ def build_kg_operator(z: np.ndarray, r: np.ndarray, R: np.ndarray, field: FieldP
 
     # angular and mass/curvature terms
     ang_term = (field.m_theta**2) / np.clip(r**2, 1e-18, None)
+    if solvent_attenuation is not None and len(solvent_attenuation) >= n:
+        ang_term = ang_term * np.asarray(solvent_attenuation, dtype=float)
     pot = ang_term + (field.mu**2 + field.xi * R)
 
     # add potential to main diagonal
