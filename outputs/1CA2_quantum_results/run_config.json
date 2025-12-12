@@ -1,0 +1,63 @@
+{
+  "pdb_id": "1CA2",
+  "mode": "production_qm",
+  "lambda_cfg": {
+    "lam": 1.224744871391589,
+    "z_min": -10.0,
+    "z_max": 10.0,
+    "num_z": 512,
+    "mu": 0.5,
+    "xi": 0.1,
+    "m_theta": 0,
+    "k_eig": 50,
+    "epsilon": 0.025,
+    "epsilon_schedule": null
+  },
+  "phase5_params": {
+    "max_l": 4,
+    "radial_points": 32,
+    "regularization": 1e-06
+  },
+  "ligc_cfg": {
+    "grid_shape": [
+      4,
+      4,
+      4
+    ],
+    "curvature_weight": 1.0,
+    "entropy_weight": 1.0,
+    "energy_weight": 1.0,
+    "gamma_prior": null,
+    "delta_prior": null
+  },
+  "stress_cfg": {
+    "smoothing": 0.1,
+    "residual_weight": 1.0,
+    "einstein_tol": 5.0
+  },
+  "wbs_cfg": {
+    "lam": 1.224744871391589,
+    "epsilon_ladder": [
+      0.1,
+      0.05,
+      0.01
+    ],
+    "z_extent": 10.0
+  },
+  "ramp": {
+    "type": "cos",
+    "ramp_time": 6.5,
+    "n_steps": 350,
+    "dt": 0.035,
+    "method": "leapfrog",
+    "k_eig": 50,
+    "basis_variant": null
+  },
+  "seed": 9021,
+  "backend_registry": {
+    "qm": "deterministic-qm",
+    "docking": "deterministic-docking",
+    "md": "deterministic-md",
+    "admet": "deterministic-admet"
+  }
+}
