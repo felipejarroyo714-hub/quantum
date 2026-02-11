@@ -48,11 +48,26 @@ import zipfile
 from datetime import datetime
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib import error as urlerror, request as urlrequest
 
 import numpy as np
+
+from adiabatic_budget import AdiabaticBudget, WBSConfig, initialize_budget_from_lambda_wbs, update_budget_with_experiment
+from backend_registry import BackendRegistry
+from experiment_record import ExperimentRecord, build_energy_profile_from_results
+from chem_utils import default_rdkit_featurizer, sanitize_smiles
+from lambda_geometry_prior import (
+    LambdaPrior,
+    LambdaPriorConfig,
+    MoleculeRecord,
+    TargetRecord,
+    build_lambda_prior_for_complex,
+    get_lambda_descriptor_vector,
+)
+from ligc_unified_potential import LigcConfig, compute_ligc_for_experiment
 
 from kg_scale_invariant_metric import (
     FieldParams,
@@ -61,6 +76,7 @@ from kg_scale_invariant_metric import (
     compute_modes,
     integrate_profile,
 )
+from phase5_unification_bridge import Phase5Params, SpatialGrid, build_phase5_covariant_prior
 from phase4_entanglement import (
     Params as EntanglementParams,
     build_adjacency,
@@ -68,6 +84,11 @@ from phase4_entanglement import (
     build_hamiltonian,
     single_particle_entropy_for_cut,
 )
+from stress_alignment import StressAlignParams, renormalize_experiment_stress
+from qm_engine import compute_qm_properties
+from docking_engine import dock_ligand_to_target
+from md_engine import run_md_for_complex
+from admet_engine import predict_admet
 from rl_rewards import RewardPrimitives
 
 
@@ -90,7 +111,41 @@ SHAP_AVAILABLE = importlib.util.find_spec("shap") is not None
 logger = logging.getLogger(__name__)
 
 
+class SimulationMode(Enum):
+    DEBUG_SYNTHETIC = "debug_synthetic"
+    BENCHMARK_PUBLIC = "benchmark_public"
+    PRODUCTION_QM = "production_qm"
+
+
+@dataclass
+class SimulationConfig:
+    mode: SimulationMode = SimulationMode.DEBUG_SYNTHETIC
+    allow_stub: bool = False
+    qm_backend: str | None = None
+    docking_backend: str | None = None
+    md_backend: str | None = None
+    admet_backend: str | None = None
+    benchmark_datasets: List[str] = field(default_factory=list)
+    lambda_cfg: LambdaPriorConfig | None = None
+    ligc_cfg: LigcConfig | None = None
+    stress_cfg: StressAlignParams | None = None
+    phase5_params: Phase5Params | None = None
+
+
+_GLOBAL_SIM_MODE: SimulationMode = SimulationMode.DEBUG_SYNTHETIC
+SIMULATION_UNPUBLISHABLE: bool = False
+
+
+def set_global_simulation_mode(mode: SimulationMode, allow_stub: bool = False) -> None:
+    global _GLOBAL_SIM_MODE
+    _GLOBAL_SIM_MODE = mode
+    if mode is not SimulationMode.DEBUG_SYNTHETIC and allow_stub:
+        logger.warning("allow_stub=True in non-debug mode; this should be used only for incremental integration")
+
+
 def _deterministic_score(identifier: str) -> float:
+    if _GLOBAL_SIM_MODE is not SimulationMode.DEBUG_SYNTHETIC:
+        raise RuntimeError("Deterministic synthetic scores are only permitted in DEBUG_SYNTHETIC mode")
     digest = hashlib.sha256(identifier.encode("utf-8")).digest()
     value = int.from_bytes(digest[:8], "big")
     return value / float(2**64 - 1)
@@ -820,14 +875,26 @@ class LightweightLLM:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class FeatureBuilderConfig:
+    fingerprint_size: int = 2048
+    include_lambda: bool = True
+    lambda_pad: int = 16
+
+
 class FeatureExtractor:
     """Feature extraction for diverse chemical, structural, and quantum data."""
 
-    def __init__(self, fingerprint_size: int = 256) -> None:
-        self.fingerprint_size = fingerprint_size
+    def __init__(
+        self,
+        feature_cfg: Optional[FeatureBuilderConfig] = None,
+        rdkit_featurizer: Optional[Callable[[str], np.ndarray]] = None,
+    ) -> None:
+        self.feature_cfg = feature_cfg or FeatureBuilderConfig()
+        self._rdkit_featurizer = rdkit_featurizer
 
     def _hash_sequence(self, sequence: str, size: Optional[int] = None) -> np.ndarray:
-        length = size or self.fingerprint_size
+        length = size or self.feature_cfg.fingerprint_size
         if length <= 0:
             length = 64
         vector = np.zeros(length, dtype=float)
@@ -842,10 +909,12 @@ class FeatureExtractor:
         return vector
 
     def featurize_smiles(self, smiles: str) -> np.ndarray:
-        return self._hash_sequence(smiles, self.fingerprint_size)
+        if self._rdkit_featurizer is not None:
+            return np.atleast_1d(self._rdkit_featurizer(smiles)).astype(float)
+        return self._hash_sequence(smiles, self.feature_cfg.fingerprint_size)
 
     def featurize_sequence(self, sequence: str) -> np.ndarray:
-        return self._hash_sequence(sequence, self.fingerprint_size // 2)
+        return self._hash_sequence(sequence, self.feature_cfg.fingerprint_size // 2)
 
     def featurize_quantum_sample(self, sample: Dict[str, Any]) -> np.ndarray:
         orbital = np.array(sample.get("orbitalOccupations", [0.25, 0.25, 0.25, 0.25]), dtype=float)
@@ -886,16 +955,175 @@ class FeatureExtractor:
                     float(entry.get("lambdaOccupancy", 0.0)),
                     float(entry.get("lambdaLeakage", 0.0)),
                 ]
-            )
+        )
         if not vector:
             vector = [0.0] * 7
         return np.array(vector, dtype=float)
+
+    def featurize_lambda_prior(self, lambda_prior: Optional[LambdaPrior]) -> np.ndarray:
+        if not self.feature_cfg.include_lambda or lambda_prior is None:
+            return np.zeros(self.feature_cfg.lambda_pad, dtype=float)
+        vector = get_lambda_descriptor_vector(lambda_prior)
+        if vector.size < self.feature_cfg.lambda_pad:
+            padded = np.zeros(self.feature_cfg.lambda_pad, dtype=float)
+            padded[: vector.size] = vector
+            return padded
+        return vector[: self.feature_cfg.lambda_pad]
+
+    def build_feature_vector(
+        self, smiles: str, lambda_prior: Optional[LambdaPrior] = None, *additional: np.ndarray
+    ) -> np.ndarray:
+        smiles_feat = self.featurize_smiles(smiles)
+        lambda_feat = self.featurize_lambda_prior(lambda_prior)
+        base = self.combine_features(smiles_feat, lambda_feat) if self.feature_cfg.include_lambda else smiles_feat
+        if additional:
+            base = self.combine_features(base, *additional)
+        return base
 
     def combine_features(self, *features: np.ndarray) -> np.ndarray:
         if not features:
             return np.zeros(1, dtype=float)
         flattened = [np.atleast_1d(feature).astype(float) for feature in features]
         return np.concatenate(flattened)
+
+
+def sanity_check_experiment(exp: ExperimentRecord) -> None:
+    flags: List[str] = []
+
+    if exp.docking_result:
+        be = exp.docking_result.get("binding_energy")
+        if be is not None and not (-30.0 <= float(be) <= -0.5):
+            flags.append(f"binding_energy_out_of_range:{float(be):.2f}")
+        rmsd = exp.docking_result.get("pose_rmsd")
+        if rmsd is not None and (float(rmsd) < 0.0 or float(rmsd) > 10.0):
+            flags.append(f"pose_rmsd_out_of_range:{float(rmsd):.2f}")
+
+    if exp.qm_result:
+        homo = exp.qm_result.get("homo")
+        if homo is not None and not (-15.0 <= float(homo) <= 0.5):
+            flags.append(f"homo_out_of_range:{float(homo):.2f}")
+        lumo = exp.qm_result.get("lumo")
+        if lumo is not None and not (-5.0 <= float(lumo) <= 5.0):
+            flags.append(f"lumo_out_of_range:{float(lumo):.2f}")
+        dipole = exp.qm_result.get("dipole_moment")
+        if dipole is not None and (float(dipole) < 0.0 or float(dipole) > 20.0):
+            flags.append(f"dipole_out_of_range:{float(dipole):.2f}")
+
+    if exp.md_result:
+        bound_fraction = exp.md_result.get("bound_fraction")
+        if bound_fraction is not None:
+            bf = np.asarray(bound_fraction, dtype=float)
+            if bf.size and (bf.min() < -0.05 or bf.max() > 1.05):
+                flags.append("md_bound_fraction_out_of_range")
+
+    if exp.admet_result:
+        herg = exp.admet_result.get("hERG_risk")
+        if herg is not None and not (0.0 <= float(herg) <= 1.0):
+            flags.append(f"herg_out_of_range:{float(herg):.2f}")
+        sol = exp.admet_result.get("solubility")
+        if sol is not None and (float(sol) < -15.0 or float(sol) > 10.0):
+            flags.append(f"solubility_out_of_range:{float(sol):.2f}")
+
+    if flags:
+        exp.provenance.setdefault("sanityFlags", []).extend(flags)
+
+
+def run_experiment_pipeline(
+    ligand_id: str,
+    smiles: str,
+    ligand_coords: np.ndarray,
+    target_id: str,
+    pocket_coords: np.ndarray,
+    pocket_center: np.ndarray,
+    mode: SimulationMode,
+    backend_registry: BackendRegistry,
+    feature_extractor: FeatureExtractor,
+    lambda_cfg: LambdaPriorConfig,
+    phase5_params: Phase5Params,
+    ligc_cfg: LigcConfig,
+    stress_cfg: StressAlignParams,
+    budget: AdiabaticBudget,
+    allow_stub: bool = False,
+    echo_ref_db: Optional[Callable[[str], Optional["EchoProfile"]]] = None,
+) -> ExperimentRecord:
+    if mode is not SimulationMode.DEBUG_SYNTHETIC and allow_stub:
+        raise RuntimeError("allow_stub is forbidden for benchmark/production modes")
+
+    canonical_smiles = sanitize_smiles(smiles, strict=mode is not SimulationMode.DEBUG_SYNTHETIC)
+    if canonical_smiles is None:
+        raise ValueError(f"Invalid SMILES provided for ligand {ligand_id}")
+    mol_rec = MoleculeRecord(ligand_id=ligand_id, smiles=canonical_smiles, coordinates=ligand_coords)
+    tgt_rec = TargetRecord(target_id=target_id, pocket_center=pocket_center, pocket_coordinates=pocket_coords)
+
+    if pocket_coords is None or pocket_coords.size == 0 or not np.isfinite(pocket_coords).all():
+        raise RuntimeError("Pocket coordinates are required for production simulations")
+
+    exp = ExperimentRecord(ligand_id=ligand_id, target_id=target_id)
+    exp.set_mode(mode)
+    set_global_simulation_mode(mode, allow_stub=False)
+    exp.provenance["backends"] = dict(backend_registry.metadata)
+    exp.provenance["stubBackends"] = False
+    exp.provenance["simulationMode"] = mode.value
+
+
+    exp.qm_result = backend_registry.run_qm(mol_rec, mode, allow_stub=allow_stub)
+    exp.docking_result = backend_registry.run_docking(mol_rec, tgt_rec, mode, allow_stub=allow_stub)
+    exp.md_result = backend_registry.run_md(mol_rec, tgt_rec, mode, allow_stub=allow_stub)
+    exp.admet_result = backend_registry.run_admet(canonical_smiles, mode, allow_stub=allow_stub)
+
+    exp.lambda_prior = build_lambda_prior_for_complex(mol_rec, tgt_rec, lambda_cfg)
+
+    complex_grid = SpatialGrid(coordinates=pocket_coords)
+    exp.phase5_prior = build_phase5_covariant_prior(complex_grid, phase5_params)
+    if exp.phase5_prior is not None:
+        exp.features["phase5_einstein_l2"] = exp.phase5_prior.einstein_residual.get("l2")
+        exp.features["phase5_einstein_max"] = exp.phase5_prior.einstein_residual.get("max")
+
+    build_energy_profile_from_results(exp, lambda_cfg.num_z)
+
+    shape = ligc_cfg.grid_shape
+    base_energy = float(exp.docking_result.get("binding_energy", -5.0)) if exp.docking_result else -5.0
+    exp.ricci_field = np.zeros(shape, dtype=float)
+    exp.entropy_field = np.zeros(shape, dtype=float)
+    exp.energy_field = np.full(shape, base_energy, dtype=float)
+
+    z_grid = exp.lambda_prior.z if exp.lambda_prior is not None else np.linspace(-1.0, 1.0, lambda_cfg.num_z)
+    exp.stress_alignment = renormalize_experiment_stress(exp, z_grid, stress_cfg)
+    exp.ligc_result = compute_ligc_for_experiment(exp, ligc_cfg)
+
+    einstein_tol = getattr(stress_cfg, "einstein_tol", 5.0)
+    exp.provenance["einstein_ok"] = bool(exp.stress_alignment and exp.stress_alignment.final_l2 < einstein_tol)
+    if exp.ligc_result is not None:
+        exp.provenance["ligc_status"] = exp.ligc_result.status
+        exp.provenance["ligc_consistency_score"] = 1.0 / (1.0 + exp.ligc_result.variance)
+
+    update_budget_with_experiment(budget, exp)
+    if not budget.rg_stability_flag:
+        exp.provenance["rg_unstable"] = True
+    exp.provenance.setdefault("usable_in_training", True)
+    if not exp.provenance.get("einstein_ok", True) or exp.provenance.get("rg_unstable", False):
+        exp.provenance["usable_in_training"] = False
+    if exp.ligc_result is not None and exp.ligc_result.status == "marginal" and exp.ligc_result.variance > 1.0:
+        exp.provenance["usable_in_training"] = False
+
+    if exp.md_result and "time" in exp.md_result and "bound_fraction" in exp.md_result:
+        from echo_validator import EchoCompareConfig, EchoProfile
+
+        sim_profile = EchoProfile(
+            time=np.asarray(exp.md_result["time"], dtype=float),
+            amplitude=np.asarray(exp.md_result["bound_fraction"], dtype=float),
+        )
+        ref_profile = echo_ref_db(target_id) if echo_ref_db else None
+        if ref_profile is not None:
+            cfg = EchoCompareConfig()
+            exp.attach_echo_result(sim_profile, ref_profile, cfg)
+
+    feat_vec = feature_extractor.build_feature_vector(canonical_smiles, exp.lambda_prior)
+    exp.features["lambda_enhanced_vector"] = feat_vec
+
+    sanity_check_experiment(exp)
+
+    return exp
 
 
 @dataclass
@@ -986,7 +1214,7 @@ class BenchmarkDatasetUtility:
                 )
         return records
 
-    def load(self, dataset: str, limit: int = 500) -> List[BenchmarkDatasetRecord]:
+    def load(self, dataset: str, mode: SimulationMode, limit: int = 500) -> List[BenchmarkDatasetRecord]:
         spec = self.SOURCES.get(dataset)
         if spec is None:
             return []
@@ -996,6 +1224,10 @@ class BenchmarkDatasetUtility:
                 return self._load_csv(dataset, path, spec["columns"], limit)
             except Exception as exc:  # pragma: no cover - defensive
                 logging.warning("Failed to parse %s dataset: %s", dataset, exc)
+        if mode is not SimulationMode.DEBUG_SYNTHETIC:
+            raise RuntimeError(
+                f"Dataset {dataset} unavailable in mode {mode.value}; synthetic benchmarks are forbidden outside DEBUG_SYNTHETIC"
+            )
         logging.info("Falling back to synthetic %s benchmark records", dataset)
         rng = np.random.default_rng(DEFAULT_RANDOM_SEED)
         synthetic: List[BenchmarkDatasetRecord] = []
@@ -1114,9 +1346,10 @@ class DatasetManager:
         self,
         dataset: str,
         context: QuantumContext,
+        mode: SimulationMode,
         limit: int = 500,
     ) -> Dict[str, Any]:
-        records = self.benchmark_utility.load(dataset, limit)
+        records = self.benchmark_utility.load(dataset, mode, limit)
         lambda_fp = np.asarray(LambdaScalingToolkit.fingerprint(context.lambda_shells), dtype=float)
         lambda_shell_features = self.feature_extractor.featurize_lambda_shells(context.lambda_shells)
         ingested = 0
@@ -1152,10 +1385,11 @@ class DatasetManager:
         datasets: Sequence[str],
         context: QuantumContext,
         limit: int = 500,
+        mode: SimulationMode = _GLOBAL_SIM_MODE,
     ) -> Dict[str, Any]:
         summary: Dict[str, Any] = {}
         for name in datasets:
-            summary[name] = self.integrate_benchmark_dataset(name, context, limit=limit)
+            summary[name] = self.integrate_benchmark_dataset(name, context, mode=mode, limit=limit)
         return summary
 
 
@@ -5696,13 +5930,35 @@ class DrugDiscoverySimulation:
         uniprot_accession: str,
         llm_model_path: Path,
         random_seed: int = DEFAULT_RANDOM_SEED,
+        simulation_config: SimulationConfig | None = None,
     ) -> None:
         self.pdb_id = pdb_id
         self.target_query = target_query
         self.uniprot_accession = uniprot_accession
         self.llm_model_path = llm_model_path
         self.random_seed = random_seed
+        self.simulation_config = simulation_config or SimulationConfig()
         set_global_random_seed(self.random_seed)
+        set_global_simulation_mode(self.simulation_config.mode, allow_stub=self.simulation_config.allow_stub)
+        self.backend_registry = BackendRegistry()
+        if self.simulation_config.allow_stub and self.simulation_config.mode is not SimulationMode.DEBUG_SYNTHETIC:
+            raise RuntimeError("allow_stub is forbidden for benchmark or production modes")
+
+        self.backend_registry.register_qm_backend(
+            compute_qm_properties, name=self.simulation_config.qm_backend or "deterministic-qm"
+        )
+        self.backend_registry.register_docking_backend(
+            dock_ligand_to_target, name=self.simulation_config.docking_backend or "deterministic-docking"
+        )
+        self.backend_registry.register_md_backend(
+            run_md_for_complex, name=self.simulation_config.md_backend or "deterministic-md"
+        )
+        self.backend_registry.register_admet_backend(
+            predict_admet, name=self.simulation_config.admet_backend or "deterministic-admet"
+        )
+        self.backend_registry.validate_backends_for_mode(
+            self.simulation_config.mode, allow_stub=self.simulation_config.allow_stub
+        )
         self.data_client = PublicDataClient()
         self.geometry = GeometryParams()
         self.field = FieldParams()
@@ -5726,7 +5982,7 @@ class DrugDiscoverySimulation:
                 "error": str(exc),
             }
         self.validator = PhysicalValidator(self.context, self.quantum_reference)
-        self.feature_extractor = FeatureExtractor()
+        self.feature_extractor = FeatureExtractor(rdkit_featurizer=default_rdkit_featurizer())
         self.dataset_manager = DatasetManager(
             self.feature_extractor,
             random_seed=self.random_seed,
@@ -5873,8 +6129,13 @@ class DrugDiscoverySimulation:
             step = len(self.visualizer.metric_history["bootstrap.safety.toxicity"])
             self.visualizer.log_metrics("bootstrap.safety.toxicity", step, metrics)
 
-        benchmark_names = ("DUD-E", "ChEMBL", "ZINC15")
-        self.benchmark_summary = self.dataset_manager.prepare_benchmarks(benchmark_names, self.context, limit=200)
+        benchmark_names = tuple(self.simulation_config.benchmark_datasets or [])
+        if benchmark_names:
+            self.benchmark_summary = self.dataset_manager.prepare_benchmarks(
+                benchmark_names, self.context, limit=200, mode=self.simulation_config.mode
+            )
+        else:
+            self.benchmark_summary = {}
 
         for task in ("quantum.highAffinity", "safety.toxicity"):
             records = self.dataset_manager.records.get(task, [])
@@ -6855,6 +7116,43 @@ class DrugDiscoverySimulation:
         }
         return reports
 
+    def run_single_experiment(
+        self, ligand_smiles: str, ligand_id: str | None = None, coordinates: Optional[np.ndarray] = None
+    ) -> ExperimentRecord:
+        """Lightweight entrypoint for orchestrators and RL agents."""
+
+        ligand_identifier = ligand_id or ligand_smiles
+        target_id = self.target_query
+        pocket_coords = np.zeros((0, 3), dtype=float)
+        pocket_center = np.zeros(3, dtype=float)
+
+        lambda_cfg = self.simulation_config.lambda_cfg or LambdaPriorConfig(
+            lam=LAMBDA_DILATION, z_min=-5.0, z_max=5.0, num_z=64
+        )
+        phase5_params = self.simulation_config.phase5_params or Phase5Params()
+        ligc_cfg = self.simulation_config.ligc_cfg or LigcConfig(grid_shape=(4, 4, 4))
+        stress_cfg = self.simulation_config.stress_cfg or StressAlignParams()
+        wbs_cfg = WBSConfig(lam=lambda_cfg.lam, epsilon_ladder=[0.1, 0.05, 0.01])
+        budget = initialize_budget_from_lambda_wbs(wbs_cfg)
+
+        return run_experiment_pipeline(
+            ligand_identifier,
+            ligand_smiles,
+            coordinates if coordinates is not None else np.zeros((0, 3), dtype=float),
+            target_id,
+            pocket_coords,
+            pocket_center,
+            self.simulation_config.mode,
+            self.backend_registry,
+            self.feature_extractor,
+            lambda_cfg,
+            phase5_params,
+            ligc_cfg,
+            stress_cfg,
+            budget,
+            allow_stub=self.simulation_config.allow_stub,
+        )
+
 
 # ---------------------------------------------------------------------------
 # CLI entrypoint
@@ -6877,7 +7175,21 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         default=DEFAULT_RANDOM_SEED,
         help="Random seed for reproducible agent initialization",
     )
+    parser.add_argument(
+        "--mode",
+        choices=[m.value for m in SimulationMode],
+        default=SimulationMode.DEBUG_SYNTHETIC.value,
+        help="Simulation mode governing backend requirements",
+    )
+    parser.add_argument(
+        "--allow-stub",
+        action="store_true",
+        help="Allow stubbed physics backends outside DEBUG_SYNTHETIC (for incremental integration only)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    sim_mode = SimulationMode(args.mode)
+    set_global_simulation_mode(sim_mode, allow_stub=args.allow_stub)
 
     simulation = DrugDiscoverySimulation(
         pdb_id=args.pdb_id,
@@ -6885,6 +7197,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         uniprot_accession=args.uniprot,
         llm_model_path=Path(args.llm_model_path),
         random_seed=args.random_seed,
+        simulation_config=SimulationConfig(mode=sim_mode, allow_stub=args.allow_stub),
     )
     reports = asyncio.run(simulation.run())
     print(json.dumps(reports, indent=2))
