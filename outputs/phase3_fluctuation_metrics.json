@@ -1,0 +1,34 @@
+{
+  "epsilon": 0.05,
+  "z_min": -10.0,
+  "z_max": 10.0,
+  "num_z": 1200,
+  "rho0_minmax": [
+    1.0,
+    1.0
+  ],
+  "rhoE_minmax": [
+    0.9500000430627272,
+    1.05
+  ],
+  "R0_value": -0.08220097694658267,
+  "RE_minmax": [
+    -0.21041222882256244,
+    0.04519150860406517
+  ],
+  "neg_w2_count_baseline": 8,
+  "neg_w2_count_fluct": 8,
+  "minmax_w2_baseline": [
+    -3.474365010432169,
+    34.49707248461788
+  ],
+  "minmax_w2_fluct": [
+    -3.0102147790342655,
+    35.707635881203835
+  ],
+  "mean_max_overlap": 0.7834219814681616,
+  "diag_power": 24.98412209403871,
+  "total_power": 39.23589584907683,
+  "offdiag_leakage_fraction": 0.36323304073031504,
+  "mean_nearest_freq_overlap": 0.6088013772461329
+}

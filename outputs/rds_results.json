@@ -1,0 +1,48 @@
+{
+  "omega_res": 5.322038953548578,
+  "evals_pair": [
+    -3.194371090583721,
+    2.1276678629648567
+  ],
+  "scenarios": {
+    "noise_only": {
+      "fidelity": 0.9993745438549316,
+      "Pn0": 0.6825102947619841,
+      "Pn1": 0.31588020277704004
+    },
+    "drive_only_resonant": {
+      "fidelity": 0.9877530542289784,
+      "Pn0": 0.6242209918136271,
+      "Pn1": 0.373870015824602
+    },
+    "drive_plus_noise_resonant": {
+      "fidelity": 0.9861582807592888,
+      "Pn0": 0.6307876031567022,
+      "Pn1": 0.3672905656481594
+    },
+    "drive_plus_noise_offres": {
+      "fidelity": 0.9963424829492887,
+      "Pn0": 0.6317667178309054,
+      "Pn1": 0.36652821073378083
+    }
+  },
+  "config": {
+    "lambda_scale": 1.224744871391589,
+    "num_shells": 20,
+    "nodes_per_shell": 4,
+    "base_radius": 1.0,
+    "t_hop": 1.0,
+    "V0": 5.0,
+    "between_shell_neighbor_factor": 0.45,
+    "within_shell_neighbor_factor": 1.05,
+    "random_seed": 123,
+    "random_rotate_each_shell": true,
+    "drive_eps": 0.2,
+    "noise_sigma": 0.1,
+    "noise_tau": 0.5,
+    "T": 10.0,
+    "dt": 0.05,
+    "n0": 0,
+    "n1": 1
+  }
+}
