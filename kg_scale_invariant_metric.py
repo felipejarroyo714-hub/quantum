@@ -122,7 +122,9 @@ def build_kg_operator(z: np.ndarray, r: np.ndarray, R: np.ndarray, field: FieldP
         off[i-1] = -a_minus
         # we will add off[i] later for a_plus at i contributing to (i,i+1)
 
-    # boundary conditions: Dirichlet u=0 at both ends
+    # boundary conditions: Dirichlet u=0 at both ends.
+    # Enforce by setting boundary rows to identity and removing couplings
+    # into and out of the boundary nodes to keep the matrix symmetric.
     main[0] = 1.0
     main[-1] = 1.0
 
@@ -131,6 +133,13 @@ def build_kg_operator(z: np.ndarray, r: np.ndarray, R: np.ndarray, field: FieldP
     for i in range(1, n-1):
         a_plus = r_mid_plus[i] / (r[i] * dz * dz)
         off_upper[i] = -a_plus
+
+    # Remove asymmetric boundary couplings due to Dirichlet rows/cols
+    # Row 0 and row n-1 are identity; zero the adjacent off-diagonals
+    off[0] = 0.0            # zero A[1,0]
+    off_upper[0] = 0.0      # zero A[0,1]
+    off[-1] = 0.0           # already zero by construction, keep explicit
+    off_upper[-1] = 0.0     # zero A[n-1,n-2]
 
     # angular and mass/curvature terms
     ang_term = (field.m_theta**2) / np.clip(r**2, 1e-18, None)
