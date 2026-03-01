@@ -157,21 +157,50 @@ def normalize_on_z(z: np.ndarray, u: np.ndarray) -> np.ndarray:
     return u / (norm + 1e-18)
 
 
-def check_lambda_covariance(params: GeometryParams, field: FieldParams) -> Dict[str, float]:
+def check_lambda_covariance(
+    params: GeometryParams,
+    field: FieldParams,
+    shift_steps: int = 1,
+) -> Dict[str, float]:
+    """Evaluate how well eigenmodes align after a λ-rescaling.
+
+    Parameters
+    ----------
+    params
+        Baseline geometric parameters.
+    field
+        Field parameters used to build the Klein–Gordon operator.
+    shift_steps
+        Number of logarithmic scale steps (integer multiples of ln λ) used for the
+        comparison. ``shift_steps=1`` reproduces the original behaviour where the
+        background is compared against a single λ-rescaling. Larger values probe
+        multi-step covariance.
+    """
+
+    if shift_steps < 1:
+        raise ValueError("shift_steps must be a positive integer")
+
     # Background A: r0
     zA, rA, rhoA, RA = integrate_profile(params)
     A, _ = build_kg_operator(zA, rA, RA, field)
     w2A, vA = compute_modes(A, k=min(20, field.k_eig))
 
     # Background B: r0 * λ (equiv. z-shift by +1 since r(z+1)=λ r(z) for h=α r)
-    paramsB = GeometryParams(lam=params.lam, z_min=params.z_min, z_max=params.z_max, num_z=params.num_z, r0=params.r0*params.lam, epsilon=params.epsilon)
+    paramsB = GeometryParams(
+        lam=params.lam,
+        z_min=params.z_min,
+        z_max=params.z_max,
+        num_z=params.num_z,
+        r0=params.r0 * (params.lam ** shift_steps),
+        epsilon=params.epsilon,
+    )
     zB, rB, rhoB, RB = integrate_profile(paramsB)
     B, _ = build_kg_operator(zB, rB, RB, field)
     w2B, vB = compute_modes(B, k=min(20, field.k_eig))
 
-    # Compare shapes after z-shift alignment by Δz = 1 (since x=z + const when epsilon=0)
-    delta = 1.0
-    # shift vB by +1: we need to interpolate onto zA grid
+    # Compare shapes after z-shift alignment by Δz = shift_steps
+    delta = float(shift_steps)
+    # shift vB by Δz: we need to interpolate onto zA grid
     overlaps = []
     for j in range(min(vA.shape[1], vB.shape[1])):
         uA = normalize_on_z(zA, vA[:, j])
