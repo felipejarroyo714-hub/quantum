@@ -1,0 +1,6 @@
+Phase 1 metrics
+lambda_scale = 1.224745, V0 = 5.000, t = 1.000
+Quadratic fit E ~ a n^2 + b n + c: a=4.997661, b=0.036294, c=-0.087099
+R^2 = 0.99998961
+Localization mean |x - n| = 3.734940e-03
+States per shell (|x-n|<0.15): n=0:4, n=1:4, n=2:4, n=3:4, n=4:4, n=5:4, n=6:4, n=7:4, n=8:4, n=9:4, n=10:4, n=11:4, n=12:4, n=13:4, n=14:4, n=15:4, n=16:4, n=17:4, n=18:4, n=19:2

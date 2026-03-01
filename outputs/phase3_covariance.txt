@@ -1,5 +1,19 @@
+R_expected: -0.08220097694658265
+R_mean: -0.08220097694658267
+R_std: 2.0816681711721685e-17
+--- lambda covariance (epsilon=0) ---
 w2A_min: -1.7379355754864416
 w2B_min: -3.738533485931746
 mean_overlap: 0.2756684643929786
 max_overlap: 0.7477482232166397
 num_compared: 20
+--- lambda covariance (epsilon=0.05) ---
+w2A_min: -1.9983179680175658
+w2B_min: -0.7298806927580176
+mean_overlap: 0.2573468040316356
+max_overlap: 0.883120871334646
+num_compared: 20
+--- bogoliubov-like leakage (epsilon 0 -> 0.05) ---
+leakage_fraction: 0.7055995793891634
+diag_weight: 0.2944004206108366
+k_used: 40
