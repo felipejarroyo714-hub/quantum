@@ -1,0 +1,14 @@
+iters: 1
+dt first/last: 1.289063e-05 / 1.289063e-05
+norm first/last: 0.157688 / 0.157688
+cov_mean/max: 0.832 / 0.935
+E_ren[min,median,max]: -82.506082, -0.132738, 88.315938
+Pz_ren[min,median,max]: -82.482271, -0.139795, 88.290821
+coeff E_R: -3.846356e+00
+coeff E_const: -3.959444e-01
+coeff E_rho_grad2: 1.918549e+00
+coeff E_rpp_over_r: 1.923178e+00
+coeff Pz_R: -3.846301e+00
+coeff Pz_const: -3.956110e-01
+coeff Pz_rho_grad2: 1.915272e+00
+coeff Pz_rpp_over_r: 1.923150e+00
